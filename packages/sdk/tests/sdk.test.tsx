@@ -1,0 +1,248 @@
+import crypto from 'node:crypto';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, it, expect } from 'vitest';
+import {
+  DocumentSealer,
+  HardwareFingerprint,
+  DeviceKeyStore,
+  ScreenCaptureGuard,
+  createReactNativeScreenGuard,
+  createReactNativeKeystore,
+} from '../src/index.js';
+import { EnvelopeCryptoService } from '../../backend/src/crypto/envelope.js';
+
+describe('@secure-doc/sdk - Client SDK Core Logic & Secure Viewer', () => {
+  it('generates a deterministic 64-char SHA-256 hardware fingerprint from React Native device traits', async () => {
+    const mockRnDeviceInfo = {
+      getUniqueId: async () => 'ios-secure-enclave-uuid-9911',
+      getDeviceId: () => 'iPhone16,2',
+      getBrand: () => 'Apple',
+      getSystemName: () => 'iOS',
+      getHardware: async () => 'A17Pro',
+      getTotalMemory: async () => 8589934592,
+    };
+
+    const first = await HardwareFingerprint.generateHash(mockRnDeviceInfo);
+    const second = await HardwareFingerprint.generateHash(mockRnDeviceInfo);
+
+    expect(first.hardwareHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(first.hardwareHash).toBe(second.hardwareHash);
+    expect(first.metadata).toEqual({
+      platform: 'iOS',
+      brand: 'Apple',
+      deviceId: 'iPhone16,2',
+      hardware: 'A17Pro',
+      totalMemory: 8589934592,
+    });
+  });
+
+  it('generates non-extractable RSA-OAEP 2048 keys via WebCrypto and decrypts backend-sealed envelope in RAM', async () => {
+    const keyStore = new DeviceKeyStore(undefined, 'test_alias_webcrypto');
+    const publicKeyPem = await keyStore.getOrCreatePublicKeyPem();
+
+    expect(publicKeyPem).toContain('-----BEGIN PUBLIC KEY-----');
+    expect(publicKeyPem).toContain('-----END PUBLIC KEY-----');
+
+    // Backend seals a PDF document for this device's public key
+    const targetDeviceId = 'device-webcrypto-001';
+    const originalPdfBytes = Buffer.from(
+      '%PDF-1.7\n1 0 obj\nstream\nBT (Zero Disk Write In-Memory PDF Content) Tj ET\nendstream\n%%EOF',
+      'utf-8'
+    );
+
+    const sealed = EnvelopeCryptoService.sealDocument(
+      originalPdfBytes,
+      publicKeyPem,
+      targetDeviceId
+    );
+
+    // Client SDK decrypts the envelope strictly in RAM using WebCrypto unwrapKey + decrypt
+    const decryptedBytes = await keyStore.decryptEnvelopeInMemory({
+      encryptedDocumentBase64: sealed.encryptedDocument.toString('base64'),
+      encryptedDekBase64: sealed.encryptedDek,
+      ivBase64: sealed.iv,
+      targetDeviceId,
+    });
+
+    expect(Buffer.from(decryptedBytes).toString('utf-8')).toBe(
+      originalPdfBytes.toString('utf-8')
+    );
+  });
+
+  it('supports mobile hardware keystore bridge (iOS Secure Enclave / Android Keystore) for in-memory decryption', async () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
+
+    const rnKeystore = createReactNativeKeystore({
+      hasKeyPair: async () => true,
+      generateRsaKeyPair: async () => ({ publicKeyPem: publicKey }),
+      getPublicKeyPem: async () => publicKey,
+      rsaOaepDecrypt: async (_alias, encryptedDekBase64) => {
+        const decrypted = crypto.privateDecrypt(
+          {
+            key: privateKey,
+            padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+            oaepHash: 'sha256',
+          },
+          Buffer.from(encryptedDekBase64, 'base64')
+        );
+        return decrypted.toString('base64');
+      },
+    });
+
+    const keyStore = new DeviceKeyStore(rnKeystore, 'rn_hardware_alias');
+    const pubPem = await keyStore.getOrCreatePublicKeyPem();
+    expect(pubPem).toBe(publicKey);
+
+    const targetDeviceId = 'rn-mobile-device-77';
+    const pdfPayload = Buffer.from('%PDF-1.7 Mobile Hardware Keystore Test', 'utf-8');
+    const sealed = EnvelopeCryptoService.sealDocument(pdfPayload, pubPem, targetDeviceId);
+
+    const decrypted = await keyStore.decryptEnvelopeInMemory({
+      encryptedDocumentBase64: sealed.encryptedDocument.toString('base64'),
+      encryptedDekBase64: sealed.encryptedDek,
+      ivBase64: sealed.iv,
+      targetDeviceId,
+    });
+
+    expect(Buffer.from(decrypted).equals(pdfPayload)).toBe(true);
+  });
+
+  it('completes end-to-end DocumentSealer.getDeviceToken(), fetchAndDecryptInMemory(), and RAM wipe on dispose()', async () => {
+    let registeredDeviceId = 'dev-e2e-999';
+    let storedPublicKeyPem = '';
+
+    const plaintextPdf = Buffer.from(
+      '%PDF-1.7\nBT (Confidential Acquisition Term Sheet) Tj ET\n%%EOF',
+      'utf-8'
+    );
+
+    // Mock fetch simulating Backend API (/v1/devices/register and /v1/documents/:id/payload)
+    const mockFetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/v1/devices/register')) {
+        const body = JSON.parse(String(init?.body));
+        storedPublicKeyPem = body.public_key;
+        return new Response(
+          JSON.stringify({
+            success: true,
+            registered_device_id: registeredDeviceId,
+            hardware_hash: body.hardware_hash,
+            status: 'ACTIVE',
+          }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url.includes('/v1/documents/doc-123/payload')) {
+        const sealed = EnvelopeCryptoService.sealDocument(
+          plaintextPdf,
+          storedPublicKeyPem,
+          registeredDeviceId
+        );
+        return new Response(
+          JSON.stringify({
+            success: true,
+            document_id: 'doc-123',
+            target_device_id: registeredDeviceId,
+            mime_type: 'application/pdf',
+            encrypted_dek: sealed.encryptedDek,
+            iv: sealed.iv,
+            auth_tag: sealed.authTag,
+            encrypted_document: sealed.encryptedDocument.toString('base64'),
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      return new Response('Not Found', { status: 404 });
+    };
+
+    DocumentSealer.configure({
+      apiUrl: 'https://api.docbind.internal',
+      apiKey: 'docbind_dev_api_key_2026',
+      customFetch: mockFetch,
+    });
+
+    // 1. Init & Get Device Token
+    const deviceToken = await DocumentSealer.getDeviceToken({ forceRefresh: true });
+    expect(deviceToken.deviceId).toBe(registeredDeviceId);
+    expect(deviceToken.hardwareHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(deviceToken.token).toBeTruthy();
+
+    // 2. Fetch & Decrypt Document in RAM
+    const decryptedDoc = await DocumentSealer.fetchAndDecryptInMemory(
+      'https://api.docbind.internal/v1/documents/doc-123/payload'
+    );
+
+    expect(decryptedDoc.documentId).toBe('doc-123');
+    expect(Buffer.from(decryptedDoc.bytes).toString('utf-8')).toBe(
+      plaintextPdf.toString('utf-8')
+    );
+
+    // 3. Verify dispose() zeroes out the RAM buffer
+    decryptedDoc.dispose();
+    expect(decryptedDoc.bytes.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it('activates Android FLAG_SECURE and iOS UIScreen.capturedDidChangeNotification via ScreenCaptureGuard and renders DocumentSealer.Viewer', async () => {
+    let flagSecureActive = false;
+    let captureListener: ((captured: boolean) => void) | null = null;
+
+    const rnGuard = createReactNativeScreenGuard({
+      enableSecureFlag: () => {
+        flagSecureActive = true;
+      },
+      disableSecureFlag: () => {
+        flagSecureActive = false;
+      },
+      isScreenCaptured: () => false,
+      addCaptureListener: (cb) => {
+        captureListener = cb;
+        return {
+          remove: () => {
+            captureListener = null;
+          },
+        };
+      },
+    });
+
+    const events: Array<{ obscured: boolean; reason?: string }> = [];
+    const cleanup = ScreenCaptureGuard.activate(
+      {
+        onCaptureStateChange: (obscured, reason) => {
+          events.push({ obscured, reason });
+        },
+      },
+      rnGuard
+    );
+
+    expect(flagSecureActive).toBe(true);
+    expect(captureListener).toBeTypeOf('function');
+
+    // Simulate iOS UIScreen.capturedDidChangeNotification firing
+    captureListener!(true);
+    expect(events).toHaveLength(1);
+    expect(events[0].obscured).toBe(true);
+    expect(events[0].reason).toContain('capturedDidChangeNotification');
+
+    cleanup();
+    expect(flagSecureActive).toBe(false);
+
+    // Verify <DocumentSealer.Viewer /> component matches specification interface
+    const html = renderToStaticMarkup(
+      <DocumentSealer.Viewer
+        payloadUrl="https://api.docbind.internal/v1/documents/doc-123/payload"
+        preventScreenshot={true}
+        watermark={{ text: 'user@ip', color: 'rgba(0,0,0,0.1)' }}
+      />
+    );
+
+    expect(html).toContain('data-testid="docbind-secure-viewer"');
+    expect(html).toContain('data-prevent-screenshot="true"');
+  });
+});

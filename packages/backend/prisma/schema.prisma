@@ -1,0 +1,52 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Organization {
+  id        String     @id @default(uuid())
+  api_key   String     @unique
+  name      String
+  createdAt DateTime   @default(now())
+  devices   Device[]
+  documents Document[]
+}
+
+model Device {
+  id            String       @id @default(uuid())
+  org_id        String
+  hardware_hash String       // Hashed combination of MAC, CPU ID, etc.
+  public_key    String       // PEM format (RSA-OAEP 2048 SPKI)
+  status        String       @default("ACTIVE") // ACTIVE, REVOKED
+  metadata      Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  organization  Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  documents     Document[]
+
+  @@unique([org_id, hardware_hash])
+  @@index([hardware_hash])
+}
+
+model Document {
+  id               String       @id @default(uuid())
+  org_id           String
+  target_device_id String
+  encrypted_dek    String       // AES-256 key encrypted with Device RSA-OAEP Public Key (Base64)
+  iv               String       // 12-byte GCM initialization vector (Base64)
+  auth_tag         String       // 16-byte GCM authentication tag (Base64)
+  storage_url      String       // S3 / storage path to AES-encrypted file
+  original_name    String?
+  mime_type        String       @default("application/pdf")
+  size_bytes       Int?
+  createdAt        DateTime     @default(now())
+  organization     Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  target_device    Device       @relation(fields: [target_device_id], references: [id], onDelete: Restrict)
+
+  @@index([target_device_id])
+  @@index([org_id])
+}
