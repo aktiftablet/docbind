@@ -226,6 +226,42 @@ describe('DocBind Backend - Cryptographic Architecture & REST API', () => {
         expect(decrypted.equals(original)).toBe(true);
       }
     });
+
+    it('rejects files exceeding the per-category size limit with 413', async () => {
+      const { app } = createApp();
+      const regRes = await request(app)
+        .post('/v1/devices/register')
+        .send({ device_id: 'android|pixel|limit-test', public_key: deviceKeyPair.publicKeyPem })
+        .expect(201);
+      const deviceId = regRes.body.registered_device_id as string;
+
+      const prevVideo = process.env.MAX_VIDEO_MB;
+      const prevUpload = process.env.MAX_UPLOAD_MB;
+      process.env.MAX_VIDEO_MB = String(100 / (1024 * 1024)); // 100 bytes
+      process.env.MAX_UPLOAD_MB = String(1000 / (1024 * 1024)); // 1000 bytes
+      try {
+        const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom', 'latin1'), Buffer.alloc(200)]);
+        const res = await request(app)
+          .post('/v1/documents/seal')
+          .field('target_device_id', deviceId)
+          .attach('file', mp4, 'big.mp4')
+          .expect(413);
+        expect(res.body.mime_type).toBe('video/mp4');
+        expect(res.body.max_bytes).toBe(100);
+
+        // Same-size non-media file fits under MAX_UPLOAD_MB
+        await request(app)
+          .post('/v1/documents/seal')
+          .field('target_device_id', deviceId)
+          .attach('file', Buffer.alloc(200, 0x41), 'notes.txt')
+          .expect(201);
+      } finally {
+        if (prevVideo === undefined) delete process.env.MAX_VIDEO_MB;
+        else process.env.MAX_VIDEO_MB = prevVideo;
+        if (prevUpload === undefined) delete process.env.MAX_UPLOAD_MB;
+        else process.env.MAX_UPLOAD_MB = prevUpload;
+      }
+    });
   });
 
   describe('MIME resolution', () => {

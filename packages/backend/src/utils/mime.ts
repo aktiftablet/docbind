@@ -92,8 +92,31 @@ export function resolveMimeType(
   return sniffMimeType(buf) ?? declaredClean ?? mimeFromFilename(filename) ?? DEFAULT_MIME_TYPE;
 }
 
-/** Max upload size in bytes, configurable via `MAX_UPLOAD_MB` (default 500 MB). */
+function readMbEnv(name: string, fallbackMb: number): number {
+  const mb = Number(process.env[name]);
+  return (Number.isFinite(mb) && mb > 0 ? mb : fallbackMb) * 1024 * 1024;
+}
+
+/** Max size for non-media files, configurable via `MAX_UPLOAD_MB` (default 50 MB). */
 export function getMaxUploadBytes(): number {
-  const mb = Number(process.env.MAX_UPLOAD_MB);
-  return (Number.isFinite(mb) && mb > 0 ? mb : 500) * 1024 * 1024;
+  return readMbEnv('MAX_UPLOAD_MB', 50);
+}
+
+/** Max size for video/audio files, configurable via `MAX_VIDEO_MB` (default 100 MB). */
+export function getMaxMediaBytes(): number {
+  return readMbEnv('MAX_VIDEO_MB', 100);
+}
+
+export function isMediaMime(mime: string): boolean {
+  return mime.startsWith('video/') || mime.startsWith('audio/');
+}
+
+/** Effective limit for a resolved MIME type. Files are decrypted as a single block in client RAM. */
+export function getMaxBytesForMime(mime: string): number {
+  return isMediaMime(mime) ? getMaxMediaBytes() : getMaxUploadBytes();
+}
+
+/** Absolute transport cap (largest category limit) used for Multer / JSON body parsing. */
+export function getHardUploadCapBytes(): number {
+  return Math.max(getMaxUploadBytes(), getMaxMediaBytes());
 }

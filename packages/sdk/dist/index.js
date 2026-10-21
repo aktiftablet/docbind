@@ -14,13 +14,16 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SecureDocumentViewer = exports.DocumentSealer = void 0;
+exports.DEFAULT_MAX_DECRYPT_BYTES = exports.DocumentTooLargeError = exports.SecureDocumentViewer = exports.DocumentSealer = void 0;
 const DocumentSealer_js_1 = require("./DocumentSealer.js");
 Object.defineProperty(exports, "DocumentSealer", { enumerable: true, get: function () { return DocumentSealer_js_1.DocumentSealer; } });
 const Viewer_js_1 = require("./components/Viewer.js");
 Object.defineProperty(exports, "SecureDocumentViewer", { enumerable: true, get: function () { return Viewer_js_1.SecureDocumentViewer; } });
 // Ensure DocumentSealer.Viewer is always bound when importing from '@secure-doc/sdk'
 DocumentSealer_js_1.DocumentSealer.Viewer = Viewer_js_1.SecureDocumentViewer;
+var DocumentSealer_js_2 = require("./DocumentSealer.js");
+Object.defineProperty(exports, "DocumentTooLargeError", { enumerable: true, get: function () { return DocumentSealer_js_2.DocumentTooLargeError; } });
+Object.defineProperty(exports, "DEFAULT_MAX_DECRYPT_BYTES", { enumerable: true, get: function () { return DocumentSealer_js_2.DEFAULT_MAX_DECRYPT_BYTES; } });
 __exportStar(require("./types.js"), exports);
 __exportStar(require("./media.js"), exports);
 __exportStar(require("./fingerprint/HardwareFingerprint.js"), exports);

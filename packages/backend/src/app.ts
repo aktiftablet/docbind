@@ -1,4 +1,4 @@
-import { getMaxUploadBytes } from './utils/mime.js';
+import { getHardUploadCapBytes } from './utils/mime.js';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 import { InMemoryRepository, type DataRepository } from './db/repository.js';
@@ -30,7 +30,7 @@ export function createApp(config: AppConfig = {}): {
 
   app.disable('x-powered-by');
   app.use(cors());
-  app.use(express.json({ limit: Math.ceil((getMaxUploadBytes() * 4) / 3) + 1024 * 1024 }));
+  app.use(express.json({ limit: Math.ceil((getHardUploadCapBytes() * 4) / 3) + 1024 * 1024 }));
   app.use(express.urlencoded({ extended: true }));
 
   app.get('/health', (_req: Request, res: Response) => {
@@ -68,6 +68,15 @@ export function createApp(config: AppConfig = {}): {
 
   app.use('/v1/devices', authMiddleware, createDeviceRouter(repository, cache));
   app.use('/v1/documents', authMiddleware, createDocumentRouter(repository, storage));
+
+  // Oversize JSON (base64) bodies -> 413
+  app.use((err: unknown, _req: Request, res: Response, next: (err?: unknown) => void) => {
+    if ((err as { type?: string })?.type === 'entity.too.large') {
+      res.status(413).json({ success: false, error: 'Request body too large.', max_bytes: getHardUploadCapBytes() });
+      return;
+    }
+    next(err);
+  });
 
   return { app, repository, storage, cache };
 }

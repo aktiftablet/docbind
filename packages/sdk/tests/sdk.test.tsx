@@ -260,3 +260,54 @@ describe('getMediaCategory', () => {
     expect(getMediaCategory(undefined)).toBe('other');
   });
 });
+
+import { DocumentSealer as Sealer, DocumentTooLargeError } from '../src/DocumentSealer.js';
+
+describe('in-memory decrypt size limits', () => {
+  const basePayload = {
+    document_id: 'd1',
+    target_device_id: 'dev',
+    encrypted_dek: 'x',
+    iv: 'x',
+    auth_tag: 'x',
+    encrypted_document: '',
+  };
+
+  it('resolves default and configured limits per category', () => {
+    Sealer.configure({});
+    expect(Sealer.getMaxDecryptBytes('video/mp4')).toBe(100 * 1024 * 1024);
+    expect(Sealer.getMaxDecryptBytes('application/pdf')).toBe(50 * 1024 * 1024);
+    Sealer.configure({ maxDecryptBytes: { media: 10 } });
+    expect(Sealer.getMaxDecryptBytes('audio/mpeg')).toBe(10);
+    Sealer.configure({ maxDecryptBytes: 5 });
+    expect(Sealer.getMaxDecryptBytes('image/png')).toBe(5);
+  });
+
+  it('rejects oversize payloads before decrypting', async () => {
+    Sealer.configure({ maxDecryptBytes: { media: 1000, default: 10 } });
+    await expect(
+      Sealer.decryptPayloadInMemory({ ...basePayload, mime_type: 'video/mp4', size_bytes: 2000 })
+    ).rejects.toBeInstanceOf(DocumentTooLargeError);
+    await expect(
+      Sealer.decryptPayloadInMemory({ ...basePayload, mime_type: 'application/pdf', size_bytes: 11 })
+    ).rejects.toBeInstanceOf(DocumentTooLargeError);
+  });
+
+  it('rejects via response headers before reading the body', async () => {
+    let bodyRead = false;
+    const fakeFetch = (async () => ({
+      ok: true,
+      headers: new Headers({ 'x-docbind-size-bytes': '5000', 'x-docbind-mime-type': 'video/mp4' }),
+      json: async () => {
+        bodyRead = true;
+        return {};
+      },
+    })) as unknown as typeof fetch;
+    Sealer.configure({ customFetch: fakeFetch, maxDecryptBytes: { media: 1000 } });
+    await expect(Sealer.fetchAndDecryptInMemory('https://x/v1/documents/a/payload')).rejects.toBeInstanceOf(
+      DocumentTooLargeError
+    );
+    expect(bodyRead).toBe(false);
+    Sealer.configure({ maxDecryptBytes: undefined, customFetch: undefined });
+  });
+});

@@ -16,6 +16,12 @@ export interface DocumentSealerConfig {
   apiKey?: string;
   /** Optional custom fetch implementation */
   customFetch?: typeof fetch;
+  /**
+   * Max decrypted size held in RAM. A number applies to all types; an object sets separate limits.
+   * Defaults: `{ default: 50 MB, media: 100 MB }` (media = video/audio).
+   * Oversize payloads throw `DocumentTooLargeError` before being buffered/decrypted.
+   */
+  maxDecryptBytes?: number | { default?: number; media?: number };
   /** Optional custom React Native native bridge modules */
   nativeModules?: {
     deviceInfo?: ReactNativeDeviceInfoLike;
@@ -40,6 +46,8 @@ export interface EncryptedDocumentPayload {
   target_device_id: string;
   mime_type?: string;
   original_name?: string | null;
+  /** Size of the encrypted document in bytes (~ plaintext size + 16-byte tag) */
+  size_bytes?: number;
   /** Base64-encoded AES-256 DEK encrypted with Device RSA-OAEP-256 Public Key */
   encrypted_dek: string;
   /** Base64-encoded 12-byte GCM IV */

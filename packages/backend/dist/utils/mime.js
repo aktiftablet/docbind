@@ -5,6 +5,10 @@ exports.sniffMimeType = sniffMimeType;
 exports.mimeFromFilename = mimeFromFilename;
 exports.resolveMimeType = resolveMimeType;
 exports.getMaxUploadBytes = getMaxUploadBytes;
+exports.getMaxMediaBytes = getMaxMediaBytes;
+exports.isMediaMime = isMediaMime;
+exports.getMaxBytesForMime = getMaxBytesForMime;
+exports.getHardUploadCapBytes = getHardUploadCapBytes;
 /**
  * Lightweight, dependency-free MIME detection from file signatures (magic bytes).
  * Used when the client does not provide a reliable MIME type (e.g. base64 JSON uploads
@@ -103,9 +107,27 @@ function resolveMimeType(buf, declared, filename) {
     const declaredClean = declared && declared.trim() && declared !== exports.DEFAULT_MIME_TYPE ? declared.trim().toLowerCase() : null;
     return sniffMimeType(buf) ?? declaredClean ?? mimeFromFilename(filename) ?? exports.DEFAULT_MIME_TYPE;
 }
-/** Max upload size in bytes, configurable via `MAX_UPLOAD_MB` (default 500 MB). */
+function readMbEnv(name, fallbackMb) {
+    const mb = Number(process.env[name]);
+    return (Number.isFinite(mb) && mb > 0 ? mb : fallbackMb) * 1024 * 1024;
+}
+/** Max size for non-media files, configurable via `MAX_UPLOAD_MB` (default 50 MB). */
 function getMaxUploadBytes() {
-    const mb = Number(process.env.MAX_UPLOAD_MB);
-    return (Number.isFinite(mb) && mb > 0 ? mb : 500) * 1024 * 1024;
+    return readMbEnv('MAX_UPLOAD_MB', 50);
+}
+/** Max size for video/audio files, configurable via `MAX_VIDEO_MB` (default 100 MB). */
+function getMaxMediaBytes() {
+    return readMbEnv('MAX_VIDEO_MB', 100);
+}
+function isMediaMime(mime) {
+    return mime.startsWith('video/') || mime.startsWith('audio/');
+}
+/** Effective limit for a resolved MIME type. Files are decrypted as a single block in client RAM. */
+function getMaxBytesForMime(mime) {
+    return isMediaMime(mime) ? getMaxMediaBytes() : getMaxUploadBytes();
+}
+/** Absolute transport cap (largest category limit) used for Multer / JSON body parsing. */
+function getHardUploadCapBytes() {
+    return Math.max(getMaxUploadBytes(), getMaxMediaBytes());
 }
 //# sourceMappingURL=mime.js.map

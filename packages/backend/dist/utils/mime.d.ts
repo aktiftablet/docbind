@@ -13,6 +13,13 @@ export declare function mimeFromFilename(filename: string | undefined | null): s
  * ZIP-based containers (docx/xlsx/pptx) share the same signature, so the declared/extension type wins for them.
  */
 export declare function resolveMimeType(buf: Buffer, declared?: string | null, filename?: string | null): string;
-/** Max upload size in bytes, configurable via `MAX_UPLOAD_MB` (default 500 MB). */
+/** Max size for non-media files, configurable via `MAX_UPLOAD_MB` (default 50 MB). */
 export declare function getMaxUploadBytes(): number;
+/** Max size for video/audio files, configurable via `MAX_VIDEO_MB` (default 100 MB). */
+export declare function getMaxMediaBytes(): number;
+export declare function isMediaMime(mime: string): boolean;
+/** Effective limit for a resolved MIME type. Files are decrypted as a single block in client RAM. */
+export declare function getMaxBytesForMime(mime: string): number;
+/** Absolute transport cap (largest category limit) used for Multer / JSON body parsing. */
+export declare function getHardUploadCapBytes(): number;
 //# sourceMappingURL=mime.d.ts.map
