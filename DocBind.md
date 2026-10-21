@@ -105,7 +105,7 @@ const deviceToken = await DocumentSealer.getDeviceToken();
 
 **Critical SDK Security Constraints (DO NOT IGNORE):**
 
-1. **No Disk Writes:** The decrypted file byte array MUST remain in application memory. Render by MIME type using in-memory sources (Blob URLs / Base64), e.g. an in-memory PDF renderer, `<img>`, `<video>`, `<audio>`.
+1. **No Disk Writes:** The decrypted file byte array MUST remain in application memory. Render by MIME type using in-memory sources (Blob URLs / Base64), e.g. an in-memory PDF renderer, `<img>`, `<video>`, `<audio>`. Because files are decrypted as a single block, enforce per-category size limits on both backend (`413`) and SDK (`DocumentTooLargeError`); defaults: 100 MB video/audio, 50 MB other files.
 
 2. **Screenshot Prevention:**
 

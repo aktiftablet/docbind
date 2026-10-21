@@ -27,6 +27,37 @@ Zero-Knowledge, Envelope-Encrypted File Security API (`@secure-doc/backend`) and
    - Decrypts the file into an in-memory `Uint8Array` and wipes the buffer (`bytes.fill(0)`) on component unmount.
    - Enforces anti-screenshot protections (`WindowManager.LayoutParams.FLAG_SECURE` on Android, `UIScreen.capturedDidChangeNotification` on iOS, focus/shortcut/print guards on Web) and renders a dynamic diagonal watermark grid.
 
+### Supported File Types
+
+| Category | Examples | Web rendering (`<DocumentSealer.Viewer />`) |
+|---|---|---|
+| PDF | `application/pdf` | Text layer or `<object>` (in-memory Blob URL) |
+| Image | `image/png`, `image/jpeg`, `image/webp`, `image/gif` | `<img>` (drag & context menu disabled) |
+| Video | `video/mp4`, `video/webm`, `video/quicktime` | `<video>` (`nodownload`, PiP disabled) |
+| Audio | `audio/mpeg`, `audio/wav`, `audio/ogg` | `<audio>` (`nodownload`) |
+| Text | `text/*`, `application/json`, `text/csv` | `<pre>` |
+| Other | Office (`docx`, `xlsx`, `pptx`), archives, ... | Encrypted & delivered; supply a renderer via `renderNative` |
+
+### Size Limits
+
+Files are encrypted as a single AES-GCM block, so the whole file is decrypted in client RAM (peak usage is roughly **4–5× the file size**: base64 JSON + ciphertext + plaintext + Blob copy). Limits are therefore enforced on both sides:
+
+| Layer | Video / Audio | Other files | Configure |
+|---|---|---|---|
+| Backend (`POST /v1/documents/seal`) | 100 MB | 50 MB | `MAX_VIDEO_MB`, `MAX_UPLOAD_MB` env vars |
+| SDK (before decrypt) | 100 MB | 50 MB | `DocumentSealer.configure({ maxDecryptBytes })` |
+
+- The backend returns **`413`** with `{ mime_type, max_bytes }` when a file exceeds its category limit.
+- `GET /v1/documents/:id/payload` returns `size_bytes` and the `X-DocBind-Size-Bytes` / `X-DocBind-Mime-Type` headers, so the SDK rejects oversize payloads **before buffering the body** and throws `DocumentTooLargeError`.
+
+```ts
+DocumentSealer.configure({
+  apiUrl: 'https://api.example.com',
+  // number = single limit for all types, or per category:
+  maxDecryptBytes: { media: 60 * 1024 * 1024, default: 30 * 1024 * 1024 }, // e.g. stricter on low-end phones
+});
+```
+
 ---
 
 ## 2. Project Structure
@@ -35,7 +66,7 @@ Zero-Knowledge, Envelope-Encrypted File Security API (`@secure-doc/backend`) and
   - [`src/crypto/envelope.ts`](./packages/backend/src/crypto/envelope.ts): `AES-256-GCM` + `RSA-OAEP-256` Envelope Encryption service
   - [`src/routes/devices.ts`](./packages/backend/src/routes/devices.ts): `POST /v1/devices/register`, `POST /v1/devices/:id/revoke`, `GET /v1/devices/:id`
   - [`src/routes/documents.ts`](./packages/backend/src/routes/documents.ts): `POST /v1/documents/seal`, `GET /v1/documents/:id/payload`
-  - [`src/utils/mime.ts`](./packages/backend/src/utils/mime.ts): MIME detection (magic bytes / extension) & `MAX_UPLOAD_MB` limit
+  - [`src/utils/mime.ts`](./packages/backend/src/utils/mime.ts): MIME detection (magic bytes / extension) & per-category size limits (`MAX_UPLOAD_MB`, `MAX_VIDEO_MB`)
   - [`prisma/schema.prisma`](./packages/backend/prisma/schema.prisma): `Organization`, `Device`, and `Document` models
 - [`packages/sdk`](./packages/sdk): React & React Native Client SDK (`@secure-doc/sdk`)
   - [`src/DocumentSealer.ts`](./packages/sdk/src/DocumentSealer.ts): `DocumentSealer.getDeviceToken()`, `DocumentSealer.fetchAndDecryptInMemory()`
