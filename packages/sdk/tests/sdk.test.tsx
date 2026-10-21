@@ -246,3 +246,17 @@ describe('@secure-doc/sdk - Client SDK Core Logic & Secure Viewer', () => {
     expect(html).toContain('data-prevent-screenshot="true"');
   });
 });
+
+import { getMediaCategory } from '../src/media.js';
+
+describe('getMediaCategory', () => {
+  it('maps MIME types to viewer renderer categories', () => {
+    expect(getMediaCategory('application/pdf')).toBe('pdf');
+    expect(getMediaCategory('image/png')).toBe('image');
+    expect(getMediaCategory('video/mp4; codecs="avc1"')).toBe('video');
+    expect(getMediaCategory('audio/mpeg')).toBe('audio');
+    expect(getMediaCategory('application/json')).toBe('text');
+    expect(getMediaCategory('application/vnd.openxmlformats-officedocument.wordprocessingml.document')).toBe('other');
+    expect(getMediaCategory(undefined)).toBe('other');
+  });
+});

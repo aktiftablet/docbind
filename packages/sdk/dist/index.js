@@ -22,6 +22,7 @@ Object.defineProperty(exports, "SecureDocumentViewer", { enumerable: true, get: 
 // Ensure DocumentSealer.Viewer is always bound when importing from '@secure-doc/sdk'
 DocumentSealer_js_1.DocumentSealer.Viewer = Viewer_js_1.SecureDocumentViewer;
 __exportStar(require("./types.js"), exports);
+__exportStar(require("./media.js"), exports);
 __exportStar(require("./fingerprint/HardwareFingerprint.js"), exports);
 __exportStar(require("./crypto/KeyStore.js"), exports);
 __exportStar(require("./security/ScreenCaptureGuard.js"), exports);

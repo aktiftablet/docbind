@@ -159,7 +159,7 @@ export class PrismaRepository implements DataRepository {
         auth_tag: params.authTag,
         storage_url: params.storageUrl,
         original_name: params.originalName,
-        mime_type: params.mimeType ?? 'application/pdf',
+        mime_type: params.mimeType ?? 'application/octet-stream',
         size_bytes: params.sizeBytes,
       },
     });
@@ -279,7 +279,7 @@ export class InMemoryRepository implements DataRepository {
       auth_tag: params.authTag,
       storage_url: params.storageUrl,
       original_name: params.originalName ?? null,
-      mime_type: params.mimeType ?? 'application/pdf',
+      mime_type: params.mimeType ?? 'application/octet-stream',
       size_bytes: params.sizeBytes ?? null,
       createdAt: new Date(),
     };

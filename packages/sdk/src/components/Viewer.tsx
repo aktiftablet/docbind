@@ -2,6 +2,19 @@ import React, { useEffect, useState, useMemo, type CSSProperties } from 'react';
 import { DocumentSealer } from '../DocumentSealer.js';
 import { ScreenCaptureGuard } from '../security/ScreenCaptureGuard.js';
 import type { DecryptedDocumentInMemory, SecureViewerProps } from '../types.js';
+import { getMediaCategory, type MediaCategory } from '../media.js';
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes).toString('base64');
+  }
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.byteLength; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
 
 /**
  * Extracts readable text streams or metadata from an in-memory PDF byte array
@@ -56,8 +69,10 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
   onDocumentLoaded,
   onError,
   onSecurityViolation,
+  renderNative,
   renderNativePdf,
 }) => {
+  const nativeRenderer = renderNative ?? renderNativePdf;
   const [decryptedDoc, setDecryptedDoc] = useState<DecryptedDocumentInMemory | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -128,27 +143,137 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
     };
   }, [payloadUrl, apiKey]);
 
-  const pdfMeta = useMemo(() => {
-    if (!decryptedDoc) return null;
-    return extractInMemoryPdfSummary(decryptedDoc.bytes);
-  }, [decryptedDoc]);
+  const category: MediaCategory | null = decryptedDoc
+    ? getMediaCategory(decryptedDoc.mimeType)
+    : null;
 
-  const inMemoryDataUri = useMemo(() => {
-    if (!decryptedDoc) return null;
-    let binary = '';
-    const bytes = decryptedDoc.bytes;
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
+  const pdfMeta = useMemo(() => {
+    if (!decryptedDoc || category !== 'pdf') return null;
+    return extractInMemoryPdfSummary(decryptedDoc.bytes);
+  }, [decryptedDoc, category]);
+
+  const textContent = useMemo(() => {
+    if (!decryptedDoc || category !== 'text') return null;
+    return new TextDecoder('utf-8').decode(decryptedDoc.bytes);
+  }, [decryptedDoc, category]);
+
+  // Base64 is only materialised when a native renderer needs it (RN bridges).
+  const base64InMemory = useMemo(() => {
+    if (!decryptedDoc || !nativeRenderer) return null;
+    return bytesToBase64(decryptedDoc.bytes);
+  }, [decryptedDoc, nativeRenderer]);
+
+  // In-memory object URL (Blob lives in RAM, never written to disk). Revoked on unmount.
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!decryptedDoc || nativeRenderer || category === 'text') {
+      setObjectUrl(null);
+      return;
     }
-    const base64 =
-      typeof Buffer !== 'undefined'
-        ? Buffer.from(bytes).toString('base64')
-        : btoa(binary);
-    return {
-      base64,
-      dataUri: `data:${decryptedDoc.mimeType};base64,${base64}#toolbar=0&navpanes=0&scrollbar=0`,
+    let url: string;
+    if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof Blob !== 'undefined') {
+      url = URL.createObjectURL(new Blob([decryptedDoc.bytes as Uint8Array<ArrayBuffer>], { type: decryptedDoc.mimeType }));
+    } else {
+      url = `data:${decryptedDoc.mimeType};base64,${bytesToBase64(decryptedDoc.bytes)}`;
+    }
+    setObjectUrl(url);
+    return () => {
+      if (url.startsWith('blob:')) URL.revokeObjectURL(url);
     };
-  }, [decryptedDoc]);
+  }, [decryptedDoc, nativeRenderer, category]);
+
+  const blockContextMenu = (e: React.SyntheticEvent) => e.preventDefault();
+
+  const renderMedia = (): React.ReactNode => {
+    if (!decryptedDoc) return null;
+    switch (category) {
+      case 'pdf':
+        if (pdfMeta?.extractedTextBlocks && pdfMeta.extractedTextBlocks.length > 0) {
+          return (
+            <div data-testid="docbind-pdf-text-layer" style={{ lineHeight: 1.6 }}>
+              {pdfMeta.extractedTextBlocks.map((line, i) => (
+                <p key={i} style={{ margin: '8px 0', fontSize: '15px' }}>
+                  {line}
+                </p>
+              ))}
+            </div>
+          );
+        }
+        return (
+          objectUrl && (
+            <object
+              data-testid="docbind-pdf-object"
+              data={`${objectUrl}#toolbar=0&navpanes=0&scrollbar=0`}
+              type={decryptedDoc.mimeType}
+              width="100%"
+              height="400px"
+            >
+              <p>In-Memory Decrypted PDF ({decryptedDoc.bytes.byteLength} bytes)</p>
+            </object>
+          )
+        );
+      case 'image':
+        return (
+          objectUrl && (
+            <img
+              data-testid="docbind-image"
+              src={objectUrl}
+              alt={decryptedDoc.originalName ?? 'Secure image'}
+              draggable={false}
+              onContextMenu={blockContextMenu}
+              style={{ maxWidth: '100%', maxHeight: '600px', display: 'block', margin: '0 auto', userSelect: 'none' }}
+            />
+          )
+        );
+      case 'video':
+        return (
+          objectUrl && (
+            <video
+              data-testid="docbind-video"
+              src={objectUrl}
+              controls
+              controlsList="nodownload noremoteplayback"
+              disablePictureInPicture
+              onContextMenu={blockContextMenu}
+              style={{ width: '100%', maxHeight: '600px', backgroundColor: '#000' }}
+            />
+          )
+        );
+      case 'audio':
+        return (
+          objectUrl && (
+            <audio
+              data-testid="docbind-audio"
+              src={objectUrl}
+              controls
+              controlsList="nodownload"
+              onContextMenu={blockContextMenu}
+              style={{ width: '100%' }}
+            />
+          )
+        );
+      case 'text':
+        return (
+          <pre
+            data-testid="docbind-text"
+            style={{ whiteSpace: 'pre-wrap', fontSize: '14px', userSelect: 'none' }}
+          >
+            {textContent}
+          </pre>
+        );
+      default:
+        return (
+          <div data-testid="docbind-unsupported" style={{ padding: '24px', textAlign: 'center' }}>
+            <p>
+              Preview is not available for <code>{decryptedDoc.mimeType}</code> in the browser.
+            </p>
+            <p style={{ fontSize: '13px', color: '#64748b' }}>
+              Use the <code>renderNative</code> prop to supply a custom in-memory renderer.
+            </p>
+          </div>
+        );
+    }
+  };
 
   const containerStyle: CSSProperties = {
     position: 'relative',
@@ -263,10 +388,12 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
             boxSizing: 'border-box',
           }}
         >
-          {renderNativePdf && inMemoryDataUri ? (
-            (renderNativePdf({
+          {nativeRenderer && base64InMemory !== null ? (
+            (nativeRenderer({
               bytes: decryptedDoc.bytes,
-              base64InMemory: inMemoryDataUri.base64,
+              base64InMemory,
+              mimeType: decryptedDoc.mimeType,
+              category: category ?? 'other',
             }) as React.ReactNode)
           ) : (
             <div
@@ -301,26 +428,7 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
                 </span>
               </div>
 
-              {pdfMeta?.extractedTextBlocks && pdfMeta.extractedTextBlocks.length > 0 ? (
-                <div data-testid="docbind-pdf-text-layer" style={{ lineHeight: 1.6 }}>
-                  {pdfMeta.extractedTextBlocks.map((line, i) => (
-                    <p key={i} style={{ margin: '8px 0', fontSize: '15px' }}>
-                      {line}
-                    </p>
-                  ))}
-                </div>
-              ) : (
-                inMemoryDataUri && (
-                  <object
-                    data={inMemoryDataUri.dataUri}
-                    type={decryptedDoc.mimeType}
-                    width="100%"
-                    height="400px"
-                  >
-                    <p>In-Memory Decrypted PDF ({decryptedDoc.bytes.byteLength} bytes)</p>
-                  </object>
-                )
-              )}
+              {renderMedia()}
             </div>
           )}
 

@@ -145,11 +145,11 @@ class DocumentSealer {
         return {
             documentId: payload.document_id,
             targetDeviceId: payload.target_device_id,
-            mimeType: payload.mime_type ?? 'application/pdf',
+            mimeType: payload.mime_type ?? 'application/octet-stream',
             originalName: payload.original_name ?? null,
             bytes: decryptedBytes,
             dispose: () => {
-                // Cryptographically zero out decrypted PDF bytes from RAM on unmount
+                // Cryptographically zero out decrypted file bytes from RAM on unmount
                 decryptedBytes.fill(0);
             },
         };

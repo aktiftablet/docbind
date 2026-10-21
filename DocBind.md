@@ -3,7 +3,7 @@
 
 \#\# 1. PROJECT OVERVIEW
 
-\*\*Objective:\*\* Build a "Developer-First" API and Client SDK (React Native / Web) that enables B2B customers to encrypt documents (PDFs) and lock them to a specific target device's hardware fingerprint. The document must only be decryptable on the authorized device, entirely in-memory, without ever writing the plaintext file to the disk.
+\*\*Objective:\*\* Build a "Developer-First" API and Client SDK (React Native / Web) that enables B2B customers to encrypt files of any type (PDFs, Office documents, images, video, audio) and lock them to a specific target device's hardware fingerprint. The document must only be decryptable on the authorized device, entirely in-memory, without ever writing the plaintext file to the disk.
 
 
 \*\*Target Audience:\*\* AI Coding Agent (Act as a Senior Cryptography Engineer and Full-Stack Developer).
@@ -105,7 +105,7 @@ const deviceToken = await DocumentSealer.getDeviceToken();
 
 **Critical SDK Security Constraints (DO NOT IGNORE):**
 
-1. **No Disk Writes:** The decrypted PDF byte array MUST remain in application memory. Use an in-memory PDF rendering library.
+1. **No Disk Writes:** The decrypted file byte array MUST remain in application memory. Render by MIME type using in-memory sources (Blob URLs / Base64), e.g. an in-memory PDF renderer, `<img>`, `<video>`, `<audio>`.
 
 2. **Screenshot Prevention:**
 
@@ -177,7 +177,7 @@ model Document \{
 
 - Implement the in-memory decryption flow.
 
-- Integrate a PDF viewer that accepts `ArrayBuffer` / `Base64` directly instead of a local file path.
+- Integrate MIME-aware viewers (PDF, image, video, audio, text) that accept `ArrayBuffer` / `Base64` directly instead of a local file path.
 
 - Implement anti-screenshot measures.
 

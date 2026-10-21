@@ -4,14 +4,16 @@ import multer from 'multer';
 import type { DataRepository } from '../db/repository.js';
 import type { StorageAdapter } from '../storage/storage.js';
 import { EnvelopeCryptoService } from '../crypto/envelope.js';
+import { getMaxUploadBytes, resolveMimeType } from '../utils/mime.js';
 
 /**
- * Use Multer memoryStorage strictly so uploaded plaintext PDFs never touch the server's disk.
+ * Use Multer memoryStorage strictly so uploaded plaintext files (documents, images, video, audio)
+ * never touch the server's disk.
  */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50 MB max PDF size
+    fileSize: getMaxUploadBytes(), // configurable via MAX_UPLOAD_MB (default 500 MB)
   },
 });
 
@@ -23,7 +25,7 @@ export function createDocumentRouter(
 
   /**
    * POST /v1/documents/seal
-   * Encrypts a document (PDF) in-memory for a specific target device using Envelope Encryption.
+   * Encrypts any file (PDF, Office, image, video, audio, ...) in-memory for a specific target device using Envelope Encryption.
    * Request: multipart/form-data (file + target_device_id)
    * Logic: Generate AES-256-GCM DEK -> Encrypt File in RAM -> Encrypt DEK with Device RSA-OAEP Public Key -> Store & Return.
    */
@@ -43,12 +45,13 @@ export function createDocumentRouter(
 
         // Support multipart file upload or base64 buffer in JSON body
         let fileBuffer: Buffer | undefined = req.file?.buffer;
-        let originalName = req.file?.originalname ?? 'document.pdf';
-        let mimeType = req.file?.mimetype ?? 'application/pdf';
+        let originalName: string | undefined = req.file?.originalname;
+        let declaredMime: string | undefined = req.file?.mimetype;
 
         if (!fileBuffer && typeof req.body?.file_base64 === 'string') {
           fileBuffer = Buffer.from(req.body.file_base64, 'base64');
           originalName = req.body.filename ?? originalName;
+          declaredMime = req.body.mime_type ?? declaredMime;
         }
 
         if (!fileBuffer || fileBuffer.length === 0) {
@@ -58,6 +61,9 @@ export function createDocumentRouter(
           });
           return;
         }
+
+        const mimeType = resolveMimeType(fileBuffer, declaredMime, originalName);
+        originalName = originalName ?? 'document';
 
         const device = await repo.findDeviceById(targetDeviceId);
         if (!device || device.org_id !== req.organization!.id) {

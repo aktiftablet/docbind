@@ -1,3 +1,4 @@
+import { getMaxUploadBytes } from './utils/mime.js';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 import { InMemoryRepository, type DataRepository } from './db/repository.js';
@@ -29,7 +30,7 @@ export function createApp(config: AppConfig = {}): {
 
   app.disable('x-powered-by');
   app.use(cors());
-  app.use(express.json({ limit: '50mb' }));
+  app.use(express.json({ limit: Math.ceil((getMaxUploadBytes() * 4) / 3) + 1024 * 1024 }));
   app.use(express.urlencoded({ extended: true }));
 
   app.get('/health', (_req: Request, res: Response) => {

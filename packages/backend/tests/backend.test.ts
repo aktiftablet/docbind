@@ -3,6 +3,7 @@ import request from 'supertest';
 import { describe, it, expect, beforeAll } from 'vitest';
 import { createApp } from '../src/app.js';
 import { EnvelopeCryptoService } from '../src/crypto/envelope.js';
+import { resolveMimeType } from '../src/utils/mime.js';
 
 function generateTestRsaKeyPair(modulusLength = 2048): {
   publicKeyPem: string;
@@ -174,6 +175,68 @@ describe('DocBind Backend - Cryptographic Architecture & REST API', () => {
       await request(app)
         .get(`/v1/documents/${documentId}/payload`)
         .expect(403);
+    });
+
+    it('seals non-PDF files (image, video) and resolves MIME types from content', async () => {
+      const { app } = createApp();
+      const regRes = await request(app)
+        .post('/v1/devices/register')
+        .send({ device_id: 'android|pixel|multi-format', public_key: deviceKeyPair.publicKeyPem })
+        .expect(201);
+      const deviceId = regRes.body.registered_device_id as string;
+      const hardwareHash = regRes.body.hardware_hash as string;
+
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+      const mp4 = Buffer.concat([
+        Buffer.from([0, 0, 0, 0x18]),
+        Buffer.from('ftypisom', 'latin1'),
+        Buffer.alloc(32, 7),
+      ]);
+
+      // Multipart image upload
+      const imgSeal = await request(app)
+        .post('/v1/documents/seal')
+        .field('target_device_id', deviceId)
+        .attach('file', png, 'photo.png')
+        .expect(201);
+
+      // Base64 JSON video upload without declared MIME -> sniffed from magic bytes
+      const vidSeal = await request(app)
+        .post('/v1/documents/seal')
+        .send({ target_device_id: deviceId, file_base64: mp4.toString('base64'), filename: 'clip.mp4' })
+        .expect(201);
+
+      for (const [seal, original, mime] of [
+        [imgSeal, png, 'image/png'],
+        [vidSeal, mp4, 'video/mp4'],
+      ] as const) {
+        const payload = await request(app)
+          .get(`/v1/documents/${seal.body.document_id}/payload`)
+          .set('x-device-id', deviceId)
+          .set('x-hardware-hash', hardwareHash)
+          .expect(200);
+        expect(payload.body.mime_type).toBe(mime);
+        const decrypted = EnvelopeCryptoService.unsealDocument(
+          Buffer.from(payload.body.encrypted_document, 'base64'),
+          payload.body.encrypted_dek,
+          payload.body.iv,
+          deviceKeyPair.privateKeyPem,
+          deviceId
+        );
+        expect(decrypted.equals(original)).toBe(true);
+      }
+    });
+  });
+
+  describe('MIME resolution', () => {
+    it('prefers magic bytes, then declared type, then extension', () => {
+      expect(resolveMimeType(Buffer.from('%PDF-1.7'), 'image/png')).toBe('application/pdf');
+      expect(resolveMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg');
+      expect(resolveMimeType(Buffer.from('PK\u0003\u0004'), undefined, 'report.docx')).toBe(
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      );
+      expect(resolveMimeType(Buffer.from('hello'), 'application/octet-stream', 'notes.txt')).toBe('text/plain');
+      expect(resolveMimeType(Buffer.from('???'))).toBe('application/octet-stream');
     });
   });
 });

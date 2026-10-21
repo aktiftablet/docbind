@@ -41,7 +41,7 @@ model Document {
   auth_tag         String       // 16-byte GCM authentication tag (Base64)
   storage_url      String       // S3 / storage path to AES-encrypted file
   original_name    String?
-  mime_type        String       @default("application/pdf")
+  mime_type        String       @default("application/octet-stream")
   size_bytes       Int?
   createdAt        DateTime     @default(now())
   organization     Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
