@@ -15,6 +15,15 @@ export interface DocumentSealerConfig {
     apiKey?: string;
     /** Optional custom fetch implementation */
     customFetch?: typeof fetch;
+    /**
+     * Max decrypted size held in RAM. A number applies to all types; an object sets separate limits.
+     * Defaults: `{ default: 50 MB, media: 100 MB }` (media = video/audio).
+     * Oversize payloads throw `DocumentTooLargeError` before being buffered/decrypted.
+     */
+    maxDecryptBytes?: number | {
+        default?: number;
+        media?: number;
+    };
     /** Optional custom React Native native bridge modules */
     nativeModules?: {
         deviceInfo?: ReactNativeDeviceInfoLike;
@@ -37,6 +46,8 @@ export interface EncryptedDocumentPayload {
     target_device_id: string;
     mime_type?: string;
     original_name?: string | null;
+    /** Size of the encrypted document in bytes (~ plaintext size + 16-byte tag) */
+    size_bytes?: number;
     /** Base64-encoded AES-256 DEK encrypted with Device RSA-OAEP-256 Public Key */
     encrypted_dek: string;
     /** Base64-encoded 12-byte GCM IV */
@@ -51,7 +62,7 @@ export interface DecryptedDocumentInMemory {
     targetDeviceId: string;
     mimeType: string;
     originalName?: string | null;
-    /** In-memory decrypted PDF byte array. NEVER written to disk. */
+    /** In-memory decrypted file byte array (any MIME type). NEVER written to disk. */
     bytes: Uint8Array;
     /** Wipes the decrypted bytes from RAM when the viewer unmounts */
     dispose: () => void;
@@ -74,11 +85,19 @@ export interface SecureViewerProps {
     onError?: (error: Error) => void;
     /** Optional callback fired when screenshot or screen capture is detected */
     onSecurityViolation?: (reason: string) => void;
-    /** Custom render override for React Native in-memory PDF view (receives Uint8Array/Base64 in RAM) */
-    renderNativePdf?: (data: {
-        bytes: Uint8Array;
-        base64InMemory: string;
-    }) => unknown;
+    /**
+     * Custom render override for React Native / custom in-memory views of any file type.
+     * Receives the decrypted bytes, a Base64 copy (RAM only), the MIME type and its category.
+     */
+    renderNative?: (data: NativeRenderData) => unknown;
+    /** @deprecated Use `renderNative` instead. Kept for backward compatibility. */
+    renderNativePdf?: (data: NativeRenderData) => unknown;
+}
+export interface NativeRenderData {
+    bytes: Uint8Array;
+    base64InMemory: string;
+    mimeType: string;
+    category: 'pdf' | 'image' | 'video' | 'audio' | 'text' | 'other';
 }
 export interface ReactNativeDeviceInfoLike {
     getUniqueId: () => Promise<string> | string;

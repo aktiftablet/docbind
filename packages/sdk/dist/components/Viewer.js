@@ -5,6 +5,18 @@ const jsx_runtime_1 = require("react/jsx-runtime");
 const react_1 = require("react");
 const DocumentSealer_js_1 = require("../DocumentSealer.js");
 const ScreenCaptureGuard_js_1 = require("../security/ScreenCaptureGuard.js");
+const media_js_1 = require("../media.js");
+function bytesToBase64(bytes) {
+    if (typeof Buffer !== 'undefined') {
+        return Buffer.from(bytes).toString('base64');
+    }
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.byteLength; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}
 /**
  * Extracts readable text streams or metadata from an in-memory PDF byte array
  * for zero-disk-write canvas/DOM preview alongside the in-memory PDF stream.
@@ -43,7 +55,8 @@ function extractInMemoryPdfSummary(bytes) {
  * 3. **Dynamic Watermark Overlay**: Renders a non-interactive repeating diagonal watermark
  *    grid (`watermark.text`, `watermark.color`) across the entire viewport.
  */
-const SecureDocumentViewer = ({ payloadUrl, preventScreenshot = true, watermark, apiKey, onDocumentLoaded, onError, onSecurityViolation, renderNativePdf, }) => {
+const SecureDocumentViewer = ({ payloadUrl, preventScreenshot = true, watermark, apiKey, onDocumentLoaded, onError, onSecurityViolation, renderNative, renderNativePdf, }) => {
+    const nativeRenderer = renderNative ?? renderNativePdf;
     const [decryptedDoc, setDecryptedDoc] = (0, react_1.useState)(null);
     const [loading, setLoading] = (0, react_1.useState)(true);
     const [error, setError] = (0, react_1.useState)(null);
@@ -103,27 +116,67 @@ const SecureDocumentViewer = ({ payloadUrl, preventScreenshot = true, watermark,
             }
         };
     }, [payloadUrl, apiKey]);
+    const category = decryptedDoc
+        ? (0, media_js_1.getMediaCategory)(decryptedDoc.mimeType)
+        : null;
     const pdfMeta = (0, react_1.useMemo)(() => {
-        if (!decryptedDoc)
+        if (!decryptedDoc || category !== 'pdf')
             return null;
         return extractInMemoryPdfSummary(decryptedDoc.bytes);
-    }, [decryptedDoc]);
-    const inMemoryDataUri = (0, react_1.useMemo)(() => {
+    }, [decryptedDoc, category]);
+    const textContent = (0, react_1.useMemo)(() => {
+        if (!decryptedDoc || category !== 'text')
+            return null;
+        return new TextDecoder('utf-8').decode(decryptedDoc.bytes);
+    }, [decryptedDoc, category]);
+    // Base64 is only materialised when a native renderer needs it (RN bridges).
+    const base64InMemory = (0, react_1.useMemo)(() => {
+        if (!decryptedDoc || !nativeRenderer)
+            return null;
+        return bytesToBase64(decryptedDoc.bytes);
+    }, [decryptedDoc, nativeRenderer]);
+    // In-memory object URL (Blob lives in RAM, never written to disk). Revoked on unmount.
+    const [objectUrl, setObjectUrl] = (0, react_1.useState)(null);
+    (0, react_1.useEffect)(() => {
+        if (!decryptedDoc || nativeRenderer || category === 'text') {
+            setObjectUrl(null);
+            return;
+        }
+        let url;
+        if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof Blob !== 'undefined') {
+            url = URL.createObjectURL(new Blob([decryptedDoc.bytes], { type: decryptedDoc.mimeType }));
+        }
+        else {
+            url = `data:${decryptedDoc.mimeType};base64,${bytesToBase64(decryptedDoc.bytes)}`;
+        }
+        setObjectUrl(url);
+        return () => {
+            if (url.startsWith('blob:'))
+                URL.revokeObjectURL(url);
+        };
+    }, [decryptedDoc, nativeRenderer, category]);
+    const blockContextMenu = (e) => e.preventDefault();
+    const renderMedia = () => {
         if (!decryptedDoc)
             return null;
-        let binary = '';
-        const bytes = decryptedDoc.bytes;
-        for (let i = 0; i < bytes.byteLength; i++) {
-            binary += String.fromCharCode(bytes[i]);
+        switch (category) {
+            case 'pdf':
+                if (pdfMeta?.extractedTextBlocks && pdfMeta.extractedTextBlocks.length > 0) {
+                    return ((0, jsx_runtime_1.jsx)("div", { "data-testid": "docbind-pdf-text-layer", style: { lineHeight: 1.6 }, children: pdfMeta.extractedTextBlocks.map((line, i) => ((0, jsx_runtime_1.jsx)("p", { style: { margin: '8px 0', fontSize: '15px' }, children: line }, i))) }));
+                }
+                return (objectUrl && ((0, jsx_runtime_1.jsx)("object", { "data-testid": "docbind-pdf-object", data: `${objectUrl}#toolbar=0&navpanes=0&scrollbar=0`, type: decryptedDoc.mimeType, width: "100%", height: "400px", children: (0, jsx_runtime_1.jsxs)("p", { children: ["In-Memory Decrypted PDF (", decryptedDoc.bytes.byteLength, " bytes)"] }) })));
+            case 'image':
+                return (objectUrl && ((0, jsx_runtime_1.jsx)("img", { "data-testid": "docbind-image", src: objectUrl, alt: decryptedDoc.originalName ?? 'Secure image', draggable: false, onContextMenu: blockContextMenu, style: { maxWidth: '100%', maxHeight: '600px', display: 'block', margin: '0 auto', userSelect: 'none' } })));
+            case 'video':
+                return (objectUrl && ((0, jsx_runtime_1.jsx)("video", { "data-testid": "docbind-video", src: objectUrl, controls: true, controlsList: "nodownload noremoteplayback", disablePictureInPicture: true, onContextMenu: blockContextMenu, style: { width: '100%', maxHeight: '600px', backgroundColor: '#000' } })));
+            case 'audio':
+                return (objectUrl && ((0, jsx_runtime_1.jsx)("audio", { "data-testid": "docbind-audio", src: objectUrl, controls: true, controlsList: "nodownload", onContextMenu: blockContextMenu, style: { width: '100%' } })));
+            case 'text':
+                return ((0, jsx_runtime_1.jsx)("pre", { "data-testid": "docbind-text", style: { whiteSpace: 'pre-wrap', fontSize: '14px', userSelect: 'none' }, children: textContent }));
+            default:
+                return ((0, jsx_runtime_1.jsxs)("div", { "data-testid": "docbind-unsupported", style: { padding: '24px', textAlign: 'center' }, children: [(0, jsx_runtime_1.jsxs)("p", { children: ["Preview is not available for ", (0, jsx_runtime_1.jsx)("code", { children: decryptedDoc.mimeType }), " in the browser."] }), (0, jsx_runtime_1.jsxs)("p", { style: { fontSize: '13px', color: '#64748b' }, children: ["Use the ", (0, jsx_runtime_1.jsx)("code", { children: "renderNative" }), " prop to supply a custom in-memory renderer."] })] }));
         }
-        const base64 = typeof Buffer !== 'undefined'
-            ? Buffer.from(bytes).toString('base64')
-            : btoa(binary);
-        return {
-            base64,
-            dataUri: `data:${decryptedDoc.mimeType};base64,${base64}#toolbar=0&navpanes=0&scrollbar=0`,
-        };
-    }, [decryptedDoc]);
+    };
     const containerStyle = {
         position: 'relative',
         width: '100%',
@@ -179,9 +232,11 @@ const SecureDocumentViewer = ({ payloadUrl, preventScreenshot = true, watermark,
                     minHeight: '480px',
                     padding: '20px',
                     boxSizing: 'border-box',
-                }, children: [renderNativePdf && inMemoryDataUri ? renderNativePdf({
+                }, children: [nativeRenderer && base64InMemory !== null ? nativeRenderer({
                         bytes: decryptedDoc.bytes,
-                        base64InMemory: inMemoryDataUri.base64,
+                        base64InMemory,
+                        mimeType: decryptedDoc.mimeType,
+                        category: category ?? 'other',
                     }) : ((0, jsx_runtime_1.jsxs)("div", { style: {
                             backgroundColor: '#ffffff',
                             color: '#0f172a',
@@ -197,7 +252,7 @@ const SecureDocumentViewer = ({ payloadUrl, preventScreenshot = true, watermark,
                                     marginBottom: '16px',
                                     fontSize: '12px',
                                     color: '#475569',
-                                }, children: [(0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Document ID:" }), " ", decryptedDoc.documentId] }), (0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Bound Device:" }), " ", decryptedDoc.targetDeviceId] }), (0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "RAM Buffer:" }), " ", decryptedDoc.bytes.byteLength, " bytes (Zero Disk Write)"] })] }), pdfMeta?.extractedTextBlocks && pdfMeta.extractedTextBlocks.length > 0 ? ((0, jsx_runtime_1.jsx)("div", { "data-testid": "docbind-pdf-text-layer", style: { lineHeight: 1.6 }, children: pdfMeta.extractedTextBlocks.map((line, i) => ((0, jsx_runtime_1.jsx)("p", { style: { margin: '8px 0', fontSize: '15px' }, children: line }, i))) })) : (inMemoryDataUri && ((0, jsx_runtime_1.jsx)("object", { data: inMemoryDataUri.dataUri, type: decryptedDoc.mimeType, width: "100%", height: "400px", children: (0, jsx_runtime_1.jsxs)("p", { children: ["In-Memory Decrypted PDF (", decryptedDoc.bytes.byteLength, " bytes)"] }) })))] })), watermark?.text && ((0, jsx_runtime_1.jsx)("div", { "data-testid": "docbind-viewer-watermark", style: {
+                                }, children: [(0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Document ID:" }), " ", decryptedDoc.documentId] }), (0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "Bound Device:" }), " ", decryptedDoc.targetDeviceId] }), (0, jsx_runtime_1.jsxs)("span", { children: [(0, jsx_runtime_1.jsx)("strong", { children: "RAM Buffer:" }), " ", decryptedDoc.bytes.byteLength, " bytes (Zero Disk Write)"] })] }), renderMedia()] })), watermark?.text && ((0, jsx_runtime_1.jsx)("div", { "data-testid": "docbind-viewer-watermark", style: {
                             position: 'absolute',
                             inset: 0,
                             pointerEvents: 'none',

@@ -1,5 +1,17 @@
 import type { FC } from 'react';
 import type { DecryptedDocumentInMemory, DeviceTokenResult, DocumentSealerConfig, EncryptedDocumentPayload, SecureViewerProps } from './types.js';
+/** Default client-side decrypt limits (single-block decrypt => ~4-5x file size peak RAM). */
+export declare const DEFAULT_MAX_DECRYPT_BYTES: {
+    default: number;
+    media: number;
+};
+/** Thrown when a payload exceeds the configured in-memory decrypt limit. Nothing is decrypted. */
+export declare class DocumentTooLargeError extends Error {
+    readonly sizeBytes: number;
+    readonly maxBytes: number;
+    readonly mimeType: string;
+    constructor(sizeBytes: number, maxBytes: number, mimeType: string);
+}
 /**
  * Core SDK singleton & static interface matching the DocBind specification:
  *
@@ -28,6 +40,9 @@ export declare class DocumentSealer {
      */
     static configure(config: DocumentSealerConfig): void;
     static getConfig(): DocumentSealerConfig;
+    /** Resolves the in-memory decrypt limit for a MIME type from `maxDecryptBytes` config. */
+    static getMaxDecryptBytes(mimeType: string): number;
+    private static assertWithinLimit;
     /**
      * 1. Generates or retrieves the non-extractable RSA-OAEP 2048 key pair in Secure Enclave / Keystore / IndexedDB.
      * 2. Computes the deterministic SHA-256 hardware fingerprint hash.

@@ -1,8 +1,26 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DocumentSealer = void 0;
+exports.DocumentSealer = exports.DocumentTooLargeError = exports.DEFAULT_MAX_DECRYPT_BYTES = void 0;
 const HardwareFingerprint_js_1 = require("./fingerprint/HardwareFingerprint.js");
 const KeyStore_js_1 = require("./crypto/KeyStore.js");
+const media_js_1 = require("./media.js");
+const MB = 1024 * 1024;
+/** Default client-side decrypt limits (single-block decrypt => ~4-5x file size peak RAM). */
+exports.DEFAULT_MAX_DECRYPT_BYTES = { default: 50 * MB, media: 100 * MB };
+/** Thrown when a payload exceeds the configured in-memory decrypt limit. Nothing is decrypted. */
+class DocumentTooLargeError extends Error {
+    sizeBytes;
+    maxBytes;
+    mimeType;
+    constructor(sizeBytes, maxBytes, mimeType) {
+        super(`Document too large to decrypt in memory: ${sizeBytes} bytes exceeds limit of ${maxBytes} bytes (${mimeType}).`);
+        this.sizeBytes = sizeBytes;
+        this.maxBytes = maxBytes;
+        this.mimeType = mimeType;
+        this.name = 'DocumentTooLargeError';
+    }
+}
+exports.DocumentTooLargeError = DocumentTooLargeError;
 /**
  * Core SDK singleton & static interface matching the DocBind specification:
  *
@@ -41,6 +59,23 @@ class DocumentSealer {
     }
     static getConfig() {
         return this.config;
+    }
+    /** Resolves the in-memory decrypt limit for a MIME type from `maxDecryptBytes` config. */
+    static getMaxDecryptBytes(mimeType) {
+        const cfg = this.config.maxDecryptBytes;
+        const isMedia = ['video', 'audio'].includes((0, media_js_1.getMediaCategory)(mimeType));
+        if (typeof cfg === 'number')
+            return cfg;
+        if (isMedia)
+            return cfg?.media ?? exports.DEFAULT_MAX_DECRYPT_BYTES.media;
+        return cfg?.default ?? exports.DEFAULT_MAX_DECRYPT_BYTES.default;
+    }
+    static assertWithinLimit(sizeBytes, mimeType) {
+        if (!Number.isFinite(sizeBytes) || sizeBytes <= 0)
+            return;
+        const max = this.getMaxDecryptBytes(mimeType);
+        if (sizeBytes > max)
+            throw new DocumentTooLargeError(sizeBytes, max, mimeType);
     }
     /**
      * 1. Generates or retrieves the non-extractable RSA-OAEP 2048 key pair in Secure Enclave / Keystore / IndexedDB.
@@ -128,6 +163,18 @@ class DocumentSealer {
             const errorText = await response.text().catch(() => '');
             throw new Error(`Failed to fetch encrypted document payload (${response.status}): ${errorText || response.statusText}`);
         }
+        // Pre-flight size check BEFORE buffering the body into RAM.
+        const headerMime = response.headers.get('x-docbind-mime-type');
+        const headerSize = Number(response.headers.get('x-docbind-size-bytes'));
+        const contentLength = Number(response.headers.get('content-length'));
+        if (headerMime && Number.isFinite(headerSize) && headerSize > 0) {
+            this.assertWithinLimit(headerSize, headerMime);
+        }
+        else if (headerMime && Number.isFinite(contentLength) && contentLength > 0) {
+            // Base64 JSON: plaintext ~= 3/4 of body length
+            this.assertWithinLimit(Math.floor((contentLength * 3) / 4), headerMime);
+        }
+        // Without a MIME header, the check runs in decryptPayloadInMemory() before decoding/decrypting.
         const payload = (await response.json());
         return this.decryptPayloadInMemory(payload);
     }
@@ -136,6 +183,10 @@ class DocumentSealer {
      * Never writes any temporary or plaintext file to disk.
      */
     static async decryptPayloadInMemory(payload) {
+        // Final check before base64 decode + decrypt (covers servers without size headers).
+        const mime = payload.mime_type ?? 'application/octet-stream';
+        const estimatedSize = payload.size_bytes ?? Math.floor((payload.encrypted_document.length * 3) / 4);
+        this.assertWithinLimit(estimatedSize, mime);
         const decryptedBytes = await this.keyStore.decryptEnvelopeInMemory({
             encryptedDocumentBase64: payload.encrypted_document,
             encryptedDekBase64: payload.encrypted_dek,
@@ -145,11 +196,11 @@ class DocumentSealer {
         return {
             documentId: payload.document_id,
             targetDeviceId: payload.target_device_id,
-            mimeType: payload.mime_type ?? 'application/pdf',
+            mimeType: payload.mime_type ?? 'application/octet-stream',
             originalName: payload.original_name ?? null,
             bytes: decryptedBytes,
             dispose: () => {
-                // Cryptographically zero out decrypted PDF bytes from RAM on unmount
+                // Cryptographically zero out decrypted file bytes from RAM on unmount
                 decryptedBytes.fill(0);
             },
         };

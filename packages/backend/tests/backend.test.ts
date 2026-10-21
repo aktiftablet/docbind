@@ -3,6 +3,7 @@ import request from 'supertest';
 import { describe, it, expect, beforeAll } from 'vitest';
 import { createApp } from '../src/app.js';
 import { EnvelopeCryptoService } from '../src/crypto/envelope.js';
+import { resolveMimeType } from '../src/utils/mime.js';
 
 function generateTestRsaKeyPair(modulusLength = 2048): {
   publicKeyPem: string;
@@ -174,6 +175,104 @@ describe('DocBind Backend - Cryptographic Architecture & REST API', () => {
       await request(app)
         .get(`/v1/documents/${documentId}/payload`)
         .expect(403);
+    });
+
+    it('seals non-PDF files (image, video) and resolves MIME types from content', async () => {
+      const { app } = createApp();
+      const regRes = await request(app)
+        .post('/v1/devices/register')
+        .send({ device_id: 'android|pixel|multi-format', public_key: deviceKeyPair.publicKeyPem })
+        .expect(201);
+      const deviceId = regRes.body.registered_device_id as string;
+      const hardwareHash = regRes.body.hardware_hash as string;
+
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+      const mp4 = Buffer.concat([
+        Buffer.from([0, 0, 0, 0x18]),
+        Buffer.from('ftypisom', 'latin1'),
+        Buffer.alloc(32, 7),
+      ]);
+
+      // Multipart image upload
+      const imgSeal = await request(app)
+        .post('/v1/documents/seal')
+        .field('target_device_id', deviceId)
+        .attach('file', png, 'photo.png')
+        .expect(201);
+
+      // Base64 JSON video upload without declared MIME -> sniffed from magic bytes
+      const vidSeal = await request(app)
+        .post('/v1/documents/seal')
+        .send({ target_device_id: deviceId, file_base64: mp4.toString('base64'), filename: 'clip.mp4' })
+        .expect(201);
+
+      for (const [seal, original, mime] of [
+        [imgSeal, png, 'image/png'],
+        [vidSeal, mp4, 'video/mp4'],
+      ] as const) {
+        const payload = await request(app)
+          .get(`/v1/documents/${seal.body.document_id}/payload`)
+          .set('x-device-id', deviceId)
+          .set('x-hardware-hash', hardwareHash)
+          .expect(200);
+        expect(payload.body.mime_type).toBe(mime);
+        const decrypted = EnvelopeCryptoService.unsealDocument(
+          Buffer.from(payload.body.encrypted_document, 'base64'),
+          payload.body.encrypted_dek,
+          payload.body.iv,
+          deviceKeyPair.privateKeyPem,
+          deviceId
+        );
+        expect(decrypted.equals(original)).toBe(true);
+      }
+    });
+
+    it('rejects files exceeding the per-category size limit with 413', async () => {
+      const { app } = createApp();
+      const regRes = await request(app)
+        .post('/v1/devices/register')
+        .send({ device_id: 'android|pixel|limit-test', public_key: deviceKeyPair.publicKeyPem })
+        .expect(201);
+      const deviceId = regRes.body.registered_device_id as string;
+
+      const prevVideo = process.env.MAX_VIDEO_MB;
+      const prevUpload = process.env.MAX_UPLOAD_MB;
+      process.env.MAX_VIDEO_MB = String(100 / (1024 * 1024)); // 100 bytes
+      process.env.MAX_UPLOAD_MB = String(1000 / (1024 * 1024)); // 1000 bytes
+      try {
+        const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom', 'latin1'), Buffer.alloc(200)]);
+        const res = await request(app)
+          .post('/v1/documents/seal')
+          .field('target_device_id', deviceId)
+          .attach('file', mp4, 'big.mp4')
+          .expect(413);
+        expect(res.body.mime_type).toBe('video/mp4');
+        expect(res.body.max_bytes).toBe(100);
+
+        // Same-size non-media file fits under MAX_UPLOAD_MB
+        await request(app)
+          .post('/v1/documents/seal')
+          .field('target_device_id', deviceId)
+          .attach('file', Buffer.alloc(200, 0x41), 'notes.txt')
+          .expect(201);
+      } finally {
+        if (prevVideo === undefined) delete process.env.MAX_VIDEO_MB;
+        else process.env.MAX_VIDEO_MB = prevVideo;
+        if (prevUpload === undefined) delete process.env.MAX_UPLOAD_MB;
+        else process.env.MAX_UPLOAD_MB = prevUpload;
+      }
+    });
+  });
+
+  describe('MIME resolution', () => {
+    it('prefers magic bytes, then declared type, then extension', () => {
+      expect(resolveMimeType(Buffer.from('%PDF-1.7'), 'image/png')).toBe('application/pdf');
+      expect(resolveMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg');
+      expect(resolveMimeType(Buffer.from('PK\u0003\u0004'), undefined, 'report.docx')).toBe(
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      );
+      expect(resolveMimeType(Buffer.from('hello'), 'application/octet-stream', 'notes.txt')).toBe('text/plain');
+      expect(resolveMimeType(Buffer.from('???'))).toBe('application/octet-stream');
     });
   });
 });

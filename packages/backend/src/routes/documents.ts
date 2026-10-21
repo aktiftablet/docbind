@@ -4,16 +4,37 @@ import multer from 'multer';
 import type { DataRepository } from '../db/repository.js';
 import type { StorageAdapter } from '../storage/storage.js';
 import { EnvelopeCryptoService } from '../crypto/envelope.js';
+import { getHardUploadCapBytes, getMaxBytesForMime, resolveMimeType } from '../utils/mime.js';
 
 /**
- * Use Multer memoryStorage strictly so uploaded plaintext PDFs never touch the server's disk.
+ * Use Multer memoryStorage strictly so uploaded plaintext files (documents, images, video, audio)
+ * never touch the server's disk.
  */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50 MB max PDF size
+    // Transport cap = largest category limit; per-category limits are enforced after MIME resolution.
+    fileSize: getHardUploadCapBytes(),
   },
 });
+
+/** Wraps Multer so oversize uploads return 413 instead of a generic 500. */
+function uploadSingle(field: string) {
+  const handler = upload.single(field);
+  return (req: Request, res: Response, next: (err?: unknown) => void): void => {
+    handler(req, res, (err?: unknown) => {
+      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+        res.status(413).json({
+          success: false,
+          error: 'File too large.',
+          max_bytes: getHardUploadCapBytes(),
+        });
+        return;
+      }
+      next(err);
+    });
+  };
+}
 
 export function createDocumentRouter(
   repo: DataRepository,
@@ -23,13 +44,13 @@ export function createDocumentRouter(
 
   /**
    * POST /v1/documents/seal
-   * Encrypts a document (PDF) in-memory for a specific target device using Envelope Encryption.
+   * Encrypts any file (PDF, Office, image, video, audio, ...) in-memory for a specific target device using Envelope Encryption.
    * Request: multipart/form-data (file + target_device_id)
    * Logic: Generate AES-256-GCM DEK -> Encrypt File in RAM -> Encrypt DEK with Device RSA-OAEP Public Key -> Store & Return.
    */
   router.post(
     '/seal',
-    upload.single('file'),
+    uploadSingle('file'),
     async (req: Request, res: Response): Promise<void> => {
       try {
         const targetDeviceId = req.body?.target_device_id as string | undefined;
@@ -43,18 +64,35 @@ export function createDocumentRouter(
 
         // Support multipart file upload or base64 buffer in JSON body
         let fileBuffer: Buffer | undefined = req.file?.buffer;
-        let originalName = req.file?.originalname ?? 'document.pdf';
-        let mimeType = req.file?.mimetype ?? 'application/pdf';
+        let originalName: string | undefined = req.file?.originalname;
+        let declaredMime: string | undefined = req.file?.mimetype;
 
         if (!fileBuffer && typeof req.body?.file_base64 === 'string') {
           fileBuffer = Buffer.from(req.body.file_base64, 'base64');
           originalName = req.body.filename ?? originalName;
+          declaredMime = req.body.mime_type ?? declaredMime;
         }
 
         if (!fileBuffer || fileBuffer.length === 0) {
           res.status(400).json({
             success: false,
             error: 'Missing document file. Upload via multipart/form-data field "file".',
+          });
+          return;
+        }
+
+        const mimeType = resolveMimeType(fileBuffer, declaredMime, originalName);
+        originalName = originalName ?? 'document';
+
+        // Single-block AES-GCM => whole file must fit in client RAM. Enforce per-category limit.
+        const maxBytes = getMaxBytesForMime(mimeType);
+        if (fileBuffer.length > maxBytes) {
+          fileBuffer.fill(0);
+          res.status(413).json({
+            success: false,
+            error: `File too large for ${mimeType}: ${fileBuffer.length} bytes exceeds limit of ${maxBytes} bytes.`,
+            mime_type: mimeType,
+            max_bytes: maxBytes,
           });
           return;
         }
@@ -182,6 +220,10 @@ export function createDocumentRouter(
       // Prevent caching of sensitive encrypted payloads on intermediaries
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
       res.setHeader('Pragma', 'no-cache');
+      // Lets the SDK reject oversize payloads before buffering the body into RAM.
+      res.setHeader('X-DocBind-Size-Bytes', String(encryptedBlob.length));
+      res.setHeader('X-DocBind-Mime-Type', document.mime_type);
+      res.setHeader('Access-Control-Expose-Headers', 'X-DocBind-Size-Bytes, X-DocBind-Mime-Type');
 
       res.status(200).json({
         success: true,
@@ -189,6 +231,7 @@ export function createDocumentRouter(
         target_device_id: document.target_device_id,
         mime_type: document.mime_type,
         original_name: document.original_name,
+        size_bytes: encryptedBlob.length,
         encrypted_dek: document.encrypted_dek,
         iv: document.iv,
         auth_tag: document.auth_tag,
