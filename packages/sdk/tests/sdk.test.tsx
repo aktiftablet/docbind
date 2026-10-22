@@ -70,7 +70,7 @@ describe('@secure-doc/sdk - Client SDK Core Logic & Secure Viewer', () => {
     );
   });
 
-  it('supports mobile hardware keystore bridge (iOS Secure Enclave / Android Keystore) for in-memory decryption', async () => {
+  it('supports mobile hardware keystore bridge (iOS Keychain / Android Keystore) for in-memory decryption', async () => {
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 2048,
       publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -133,6 +133,7 @@ describe('@secure-doc/sdk - Client SDK Core Logic & Secure Viewer', () => {
             registered_device_id: registeredDeviceId,
             hardware_hash: body.hardware_hash,
             status: 'ACTIVE',
+            device_token: 'scoped-device-token',
           }),
           { status: 201, headers: { 'Content-Type': 'application/json' } }
         );
@@ -164,7 +165,7 @@ describe('@secure-doc/sdk - Client SDK Core Logic & Secure Viewer', () => {
 
     DocumentSealer.configure({
       apiUrl: 'https://api.docbind.internal',
-      apiKey: 'docbind_dev_api_key_2026',
+      enrollmentToken: 'approved-enrollment-token',
       customFetch: mockFetch,
     });
 
@@ -303,11 +304,79 @@ describe('in-memory decrypt size limits', () => {
         return {};
       },
     })) as unknown as typeof fetch;
-    Sealer.configure({ customFetch: fakeFetch, maxDecryptBytes: { media: 1000 } });
+    Sealer.configure({ apiUrl: 'https://x', deviceToken: 'device-token', customFetch: fakeFetch, maxDecryptBytes: { media: 1000 } });
     await expect(Sealer.fetchAndDecryptInMemory('https://x/v1/documents/a/payload')).rejects.toBeInstanceOf(
       DocumentTooLargeError
     );
     expect(bodyRead).toBe(false);
     Sealer.configure({ maxDecryptBytes: undefined, customFetch: undefined });
+  });
+});
+
+describe('Hardened enrollment and envelope compatibility', () => {
+  it('decrypts authenticated v2 metadata in WebCrypto and rejects a document swap', async () => {
+    const store = new DeviceKeyStore(undefined, 'v2-key');
+    const publicKey = await store.getOrCreatePublicKeyPem();
+    const binding = { targetDeviceId: 'device', documentId: 'doc', mimeType: 'text/plain' };
+    const sealed = EnvelopeCryptoService.sealDocument(Buffer.from('v2 secret'), publicKey, binding);
+    const input = {
+      encryptedDocumentBase64: sealed.encryptedDocument.toString('base64'),
+      encryptedDekBase64: sealed.encryptedDek,
+      ivBase64: sealed.iv,
+      ...binding,
+      aadVersion: sealed.aadVersion,
+      keyAlgorithm: sealed.keyAlgorithm,
+    };
+    expect(Buffer.from(await store.decryptEnvelopeInMemory(input)).toString()).toBe('v2 secret');
+    await expect(store.decryptEnvelopeInMemory({ ...input, documentId: 'swapped' })).rejects.toThrow();
+  });
+
+  it('negotiates Android MGF1-SHA1, supports reopening its key and decrypts a v2 envelope', async () => {
+    const pair = crypto.generateKeyPairSync('rsa', { modulusLength: 2048, publicKeyEncoding: { type: 'spki', format: 'pem' }, privateKeyEncoding: { type: 'pkcs8', format: 'pem' } });
+    let exists = false;
+    const native = createReactNativeKeystore({
+      keyAlgorithm: 'RSA-OAEP-256-MGF1-SHA1',
+      hasKeyPair: async () => exists,
+      generateRsaKeyPair: async () => { exists = true; return pair.publicKey; },
+      getPublicKeyPem: async () => pair.publicKey,
+      rsaOaepDecrypt: async (_alias, encrypted) => EnvelopeCryptoService.unwrapDek(Buffer.from(encrypted, 'base64'), pair.privateKey, 'RSA-OAEP-256-MGF1-SHA1'),
+    });
+    const store = new DeviceKeyStore(native);
+    expect(await store.getOrCreatePublicKeyPem()).toBe(pair.publicKey);
+    expect(await new DeviceKeyStore(native).getOrCreatePublicKeyPem()).toBe(pair.publicKey);
+    const binding = { targetDeviceId: 'android', documentId: 'doc', mimeType: 'text/plain' };
+    const sealed = EnvelopeCryptoService.sealDocument(Buffer.from('android secret'), pair.publicKey, binding, native.keyAlgorithm);
+    expect(Buffer.from(await store.decryptEnvelopeInMemory({
+      encryptedDocumentBase64: sealed.encryptedDocument.toString('base64'), encryptedDekBase64: sealed.encryptedDek,
+      ivBase64: sealed.iv, ...binding, aadVersion: sealed.aadVersion, keyAlgorithm: sealed.keyAlgorithm,
+    })).toString()).toBe('android secret');
+  });
+
+  it('uses scoped bearer credentials, accepts false capture state and subscribes to native capture events', async () => {
+    let listener: ((captured: boolean) => void) | undefined;
+    let removed = false;
+    const guard = createReactNativeScreenGuard({ isScreenCaptured: async () => false }, {
+      addListener: (name, cb) => {
+        expect(name).toBe('DocBindCaptureChanged'); listener = cb;
+        return { remove: () => { removed = true; } };
+      },
+    });
+    expect(await guard.isScreenCaptured!()).toBe(false);
+    const states: boolean[] = [];
+    const dispose = guard.addCaptureChangeListener!(captured => states.push(captured));
+    listener!(true); listener!(false); dispose();
+    expect(states).toEqual([true, false]); expect(removed).toBe(true);
+
+    const fetcher: typeof fetch = async (_url, init) => {
+      const headers = init?.headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer approved-key');
+      expect(headers['x-api-key']).toBeUndefined();
+      return new Response(JSON.stringify({ registered_device_id: 'approved-device', device_token: 'device-only' }), { status: 201 });
+    };
+    DocumentSealer.configure({ apiUrl: 'https://api.example.com', enrollmentToken: 'approved-key', customFetch: fetcher });
+    const device = await DocumentSealer.getDeviceToken({ forceRefresh: true });
+    expect(device.deviceToken).toBe('device-only');
+    await expect(DocumentSealer.fetchAndDecryptInMemory('https://foreign.example.com/payload')).rejects.toThrow(/configured API origin/);
+    DocumentSealer.configure({ apiUrl: undefined, deviceToken: undefined, enrollmentToken: undefined, customFetch: undefined });
   });
 });

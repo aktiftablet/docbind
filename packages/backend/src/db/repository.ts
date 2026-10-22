@@ -1,22 +1,10 @@
 import crypto from 'node:crypto';
-
-export interface PrismaClientLike {
-  organization: {
-    findUnique(args: { where: { api_key: string } }): Promise<OrganizationRecord | null>;
-    create(args: { data: { name: string; api_key: string } }): Promise<OrganizationRecord>;
-  };
-  device: {
-    upsert(args: unknown): Promise<unknown>;
-    findUnique(args: { where: { id: string } }): Promise<unknown>;
-    update(args: { where: { id: string }; data: { status: DeviceStatus } }): Promise<unknown>;
-  };
-  document: {
-    create(args: { data: Record<string, unknown> }): Promise<DocumentRecord>;
-    findUnique(args: { where: { id: string } }): Promise<DocumentRecord | null>;
-  };
-}
+import type { AadVersion, KeyAlgorithm } from '../crypto/envelope.js';
 
 export type DeviceStatus = 'ACTIVE' | 'REVOKED';
+
+export type AccessAction = 'SEAL' | 'PAYLOAD_FETCH' | 'DELETE';
+export type AccessOutcome = 'GRANTED' | 'DENIED';
 
 export interface OrganizationRecord {
   id: string;
@@ -30,6 +18,9 @@ export interface DeviceRecord {
   org_id: string;
   hardware_hash: string;
   public_key: string;
+  /** SHA-256 (hex) of the DER SPKI public key. Device identity within an org. */
+  public_key_fingerprint: string;
+  key_algorithm: KeyAlgorithm;
   status: DeviceStatus;
   metadata?: Record<string, unknown> | null;
   createdAt: Date;
@@ -46,34 +37,102 @@ export interface DocumentRecord {
   storage_url: string;
   original_name?: string | null;
   mime_type: string;
-  size_bytes?: number | null;
+  /** Size of the stored ciphertext (plaintext + 16-byte GCM tag). */
+  encrypted_size_bytes?: number | null;
+  aad_version: AadVersion;
+  key_algorithm: KeyAlgorithm;
+  expires_at?: Date | null;
   createdAt: Date;
 }
 
+export interface AccessEventRecord {
+  id: string;
+  org_id: string;
+  document_id: string | null;
+  device_id: string | null;
+  action: AccessAction;
+  outcome: AccessOutcome;
+  reason?: string | null;
+  ip?: string | null;
+  user_agent?: string | null;
+  request_id?: string | null;
+  createdAt: Date;
+}
+
+export interface RegisterDeviceParams {
+  orgId: string;
+  hardwareHash: string;
+  publicKey: string;
+  publicKeyFingerprint: string;
+  keyAlgorithm: KeyAlgorithm;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateDocumentParams {
+  id?: string;
+  orgId: string;
+  targetDeviceId: string;
+  encryptedDek: string;
+  iv: string;
+  authTag: string;
+  storageUrl: string;
+  originalName?: string;
+  mimeType?: string;
+  encryptedSizeBytes?: number;
+  aadVersion: AadVersion;
+  keyAlgorithm: KeyAlgorithm;
+  expiresAt?: Date | null;
+}
+
+export type RecordAccessEventParams = Omit<AccessEventRecord, 'id' | 'createdAt'>;
+
 export interface DataRepository {
   findOrgByApiKey(apiKey: string): Promise<OrganizationRecord | null>;
+  findOrgById(id: string): Promise<OrganizationRecord | null>;
   createOrganization(name: string, apiKey?: string): Promise<OrganizationRecord>;
-  upsertDevice(params: {
-    orgId: string;
-    hardwareHash: string;
-    publicKey: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<DeviceRecord>;
+  /**
+   * Registers a device identified by `(orgId, publicKeyFingerprint)`.
+   * If the key is already registered, the existing record is returned **unchanged**:
+   * the public key can never be replaced and a REVOKED device is never re-activated.
+   */
+  registerDevice(params: RegisterDeviceParams): Promise<{ device: DeviceRecord; created: boolean }>;
   findDeviceById(deviceId: string): Promise<DeviceRecord | null>;
   updateDeviceStatus(deviceId: string, status: DeviceStatus): Promise<DeviceRecord | null>;
-  createDocument(params: {
-    id?: string;
-    orgId: string;
-    targetDeviceId: string;
-    encryptedDek: string;
-    iv: string;
-    authTag: string;
-    storageUrl: string;
-    originalName?: string;
-    mimeType?: string;
-    sizeBytes?: number;
-  }): Promise<DocumentRecord>;
+  createDocument(params: CreateDocumentParams): Promise<DocumentRecord>;
   findDocumentById(documentId: string): Promise<DocumentRecord | null>;
+  deleteDocument(documentId: string): Promise<void>;
+  recordAccessEvent(event: RecordAccessEventParams): Promise<void>;
+  listAccessEvents(documentId: string): Promise<AccessEventRecord[]>;
+}
+
+/** Minimal structural type of the generated Prisma client used by {@link PrismaRepository}. */
+export interface PrismaClientLike {
+  organization: {
+    findUnique(args: { where: { api_key?: string; id?: string } }): Promise<OrganizationRecord | null>;
+    create(args: { data: { name: string; api_key: string } }): Promise<OrganizationRecord>;
+  };
+  device: {
+    create(args: { data: Record<string, unknown> }): Promise<unknown>;
+    findUnique(args: { where: Record<string, unknown> }): Promise<unknown>;
+    update(args: { where: { id: string }; data: { status: DeviceStatus } }): Promise<unknown>;
+  };
+  document: {
+    create(args: { data: Record<string, unknown> }): Promise<unknown>;
+    findUnique(args: { where: { id: string } }): Promise<unknown>;
+    delete(args: { where: { id: string } }): Promise<unknown>;
+  };
+  accessEvent: {
+    create(args: { data: Record<string, unknown> }): Promise<unknown>;
+    findMany(args: { where: { document_id: string }; orderBy: { createdAt: 'asc' } }): Promise<unknown[]>;
+  };
+}
+
+function generateApiKey(): string {
+  return `db_live_${crypto.randomBytes(24).toString('hex')}`;
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  return (err as { code?: string })?.code === 'P2002';
 }
 
 /**
@@ -86,70 +145,62 @@ export class PrismaRepository implements DataRepository {
     return this.prisma.organization.findUnique({ where: { api_key: apiKey } });
   }
 
+  async findOrgById(id: string): Promise<OrganizationRecord | null> {
+    return this.prisma.organization.findUnique({ where: { id } });
+  }
+
   async createOrganization(name: string, apiKey?: string): Promise<OrganizationRecord> {
     return this.prisma.organization.create({
-      data: {
-        name,
-        api_key: apiKey ?? `db_live_${crypto.randomBytes(24).toString('hex')}`,
-      },
+      data: { name, api_key: apiKey ?? generateApiKey() },
     });
   }
 
-  async upsertDevice(params: {
-    orgId: string;
-    hardwareHash: string;
-    publicKey: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<DeviceRecord> {
-    const record = await this.prisma.device.upsert({
-      where: {
-        org_id_hardware_hash: {
+  private async findDeviceByFingerprint(orgId: string, fingerprint: string): Promise<DeviceRecord | null> {
+    const record = await this.prisma.device.findUnique({
+      where: { org_id_public_key_fingerprint: { org_id: orgId, public_key_fingerprint: fingerprint } },
+    });
+    return (record as DeviceRecord | null) ?? null;
+  }
+
+  async registerDevice(params: RegisterDeviceParams): Promise<{ device: DeviceRecord; created: boolean }> {
+    const existing = await this.findDeviceByFingerprint(params.orgId, params.publicKeyFingerprint);
+    if (existing) return { device: existing, created: false };
+
+    try {
+      const record = await this.prisma.device.create({
+        data: {
           org_id: params.orgId,
           hardware_hash: params.hardwareHash,
+          public_key: params.publicKey,
+          public_key_fingerprint: params.publicKeyFingerprint,
+          key_algorithm: params.keyAlgorithm,
+          status: 'ACTIVE',
+          metadata: params.metadata ?? undefined,
         },
-      },
-      update: {
-        public_key: params.publicKey,
-        status: 'ACTIVE',
-        metadata: (params.metadata ?? undefined) as any,
-      },
-      create: {
-        org_id: params.orgId,
-        hardware_hash: params.hardwareHash,
-        public_key: params.publicKey,
-        status: 'ACTIVE',
-        metadata: (params.metadata ?? undefined) as any,
-      },
-    });
-    return record as unknown as DeviceRecord;
+      });
+      return { device: record as DeviceRecord, created: true };
+    } catch (err) {
+      // Concurrent registration of the same key: return the winner's record.
+      if (isUniqueConstraintError(err)) {
+        const winner = await this.findDeviceByFingerprint(params.orgId, params.publicKeyFingerprint);
+        if (winner) return { device: winner, created: false };
+      }
+      throw err;
+    }
   }
 
   async findDeviceById(deviceId: string): Promise<DeviceRecord | null> {
     const record = await this.prisma.device.findUnique({ where: { id: deviceId } });
-    return record as unknown as DeviceRecord | null;
+    return (record as DeviceRecord | null) ?? null;
   }
 
   async updateDeviceStatus(deviceId: string, status: DeviceStatus): Promise<DeviceRecord | null> {
-    const record = await this.prisma.device.update({
-      where: { id: deviceId },
-      data: { status },
-    });
-    return record as unknown as DeviceRecord;
+    const record = await this.prisma.device.update({ where: { id: deviceId }, data: { status } });
+    return record as DeviceRecord;
   }
 
-  async createDocument(params: {
-    id?: string;
-    orgId: string;
-    targetDeviceId: string;
-    encryptedDek: string;
-    iv: string;
-    authTag: string;
-    storageUrl: string;
-    originalName?: string;
-    mimeType?: string;
-    sizeBytes?: number;
-  }): Promise<DocumentRecord> {
-    return this.prisma.document.create({
+  async createDocument(params: CreateDocumentParams): Promise<DocumentRecord> {
+    const record = await this.prisma.document.create({
       data: {
         id: params.id,
         org_id: params.orgId,
@@ -160,39 +211,53 @@ export class PrismaRepository implements DataRepository {
         storage_url: params.storageUrl,
         original_name: params.originalName,
         mime_type: params.mimeType ?? 'application/octet-stream',
-        size_bytes: params.sizeBytes,
+        encrypted_size_bytes: params.encryptedSizeBytes,
+        aad_version: params.aadVersion,
+        key_algorithm: params.keyAlgorithm,
+        expires_at: params.expiresAt ?? null,
       },
     });
+    return record as DocumentRecord;
   }
 
   async findDocumentById(documentId: string): Promise<DocumentRecord | null> {
-    return this.prisma.document.findUnique({ where: { id: documentId } });
+    const record = await this.prisma.document.findUnique({ where: { id: documentId } });
+    return (record as DocumentRecord | null) ?? null;
+  }
+
+  async deleteDocument(documentId: string): Promise<void> {
+    await this.prisma.document.delete({ where: { id: documentId } });
+  }
+
+  async recordAccessEvent(event: RecordAccessEventParams): Promise<void> {
+    await this.prisma.accessEvent.create({ data: { ...event } });
+  }
+
+  async listAccessEvents(documentId: string): Promise<AccessEventRecord[]> {
+    const rows = await this.prisma.accessEvent.findMany({
+      where: { document_id: documentId },
+      orderBy: { createdAt: 'asc' },
+    });
+    return rows as AccessEventRecord[];
   }
 }
 
 /**
- * In-memory repository implementing the exact Prisma schema semantics.
+ * In-memory repository implementing the Prisma schema semantics.
  * Automatically seeded with a default Organization so local development and E2E tests
- * run without requiring an external PostgreSQL daemon.
+ * run without requiring an external PostgreSQL daemon. Data is lost on restart.
  */
 export class InMemoryRepository implements DataRepository {
   private readonly organizations = new Map<string, OrganizationRecord>();
   private readonly devices = new Map<string, DeviceRecord>();
   private readonly documents = new Map<string, DocumentRecord>();
+  private readonly accessEvents: AccessEventRecord[] = [];
 
-  public static readonly DEFAULT_API_KEY = 'docbind_dev_api_key_2026';
-  public static readonly DEFAULT_ORG_ID = '00000000-0000-4000-8000-000000000001';
+  /** Upper bound on retained audit events to keep memory bounded. */
+  private static readonly MAX_ACCESS_EVENTS = 10_000;
 
-  constructor(seedDefaultOrg = true) {
-    if (seedDefaultOrg) {
-      const defaultOrg: OrganizationRecord = {
-        id: InMemoryRepository.DEFAULT_ORG_ID,
-        api_key: process.env.DEFAULT_ORG_API_KEY || InMemoryRepository.DEFAULT_API_KEY,
-        name: 'Default B2B Organization',
-        createdAt: new Date(),
-      };
-      this.organizations.set(defaultOrg.id, defaultOrg);
-    }
+  async findOrgById(id: string): Promise<OrganizationRecord | null> {
+    return this.organizations.get(id) ?? null;
   }
 
   async findOrgByApiKey(apiKey: string): Promise<OrganizationRecord | null> {
@@ -207,7 +272,7 @@ export class InMemoryRepository implements DataRepository {
   async createOrganization(name: string, apiKey?: string): Promise<OrganizationRecord> {
     const org: OrganizationRecord = {
       id: crypto.randomUUID(),
-      api_key: apiKey ?? `db_live_${crypto.randomBytes(24).toString('hex')}`,
+      api_key: apiKey ?? generateApiKey(),
       name,
       createdAt: new Date(),
     };
@@ -215,19 +280,13 @@ export class InMemoryRepository implements DataRepository {
     return org;
   }
 
-  async upsertDevice(params: {
-    orgId: string;
-    hardwareHash: string;
-    publicKey: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<DeviceRecord> {
+  async registerDevice(params: RegisterDeviceParams): Promise<{ device: DeviceRecord; created: boolean }> {
     for (const existing of this.devices.values()) {
-      if (existing.org_id === params.orgId && existing.hardware_hash === params.hardwareHash) {
-        existing.public_key = params.publicKey;
-        existing.status = 'ACTIVE';
-        existing.metadata = params.metadata ?? existing.metadata;
-        existing.updatedAt = new Date();
-        return existing;
+      if (
+        existing.org_id === params.orgId &&
+        existing.public_key_fingerprint === params.publicKeyFingerprint
+      ) {
+        return { device: existing, created: false };
       }
     }
 
@@ -237,13 +296,15 @@ export class InMemoryRepository implements DataRepository {
       org_id: params.orgId,
       hardware_hash: params.hardwareHash,
       public_key: params.publicKey,
+      public_key_fingerprint: params.publicKeyFingerprint,
+      key_algorithm: params.keyAlgorithm,
       status: 'ACTIVE',
       metadata: params.metadata ?? null,
       createdAt: now,
       updatedAt: now,
     };
     this.devices.set(record.id, record);
-    return record;
+    return { device: record, created: true };
   }
 
   async findDeviceById(deviceId: string): Promise<DeviceRecord | null> {
@@ -258,18 +319,7 @@ export class InMemoryRepository implements DataRepository {
     return device;
   }
 
-  async createDocument(params: {
-    id?: string;
-    orgId: string;
-    targetDeviceId: string;
-    encryptedDek: string;
-    iv: string;
-    authTag: string;
-    storageUrl: string;
-    originalName?: string;
-    mimeType?: string;
-    sizeBytes?: number;
-  }): Promise<DocumentRecord> {
+  async createDocument(params: CreateDocumentParams): Promise<DocumentRecord> {
     const record: DocumentRecord = {
       id: params.id ?? crypto.randomUUID(),
       org_id: params.orgId,
@@ -280,7 +330,10 @@ export class InMemoryRepository implements DataRepository {
       storage_url: params.storageUrl,
       original_name: params.originalName ?? null,
       mime_type: params.mimeType ?? 'application/octet-stream',
-      size_bytes: params.sizeBytes ?? null,
+      encrypted_size_bytes: params.encryptedSizeBytes ?? null,
+      aad_version: params.aadVersion,
+      key_algorithm: params.keyAlgorithm,
+      expires_at: params.expiresAt ?? null,
       createdAt: new Date(),
     };
     this.documents.set(record.id, record);
@@ -289,5 +342,20 @@ export class InMemoryRepository implements DataRepository {
 
   async findDocumentById(documentId: string): Promise<DocumentRecord | null> {
     return this.documents.get(documentId) ?? null;
+  }
+
+  async deleteDocument(documentId: string): Promise<void> {
+    this.documents.delete(documentId);
+  }
+
+  async recordAccessEvent(event: RecordAccessEventParams): Promise<void> {
+    this.accessEvents.push({ ...event, id: crypto.randomUUID(), createdAt: new Date() });
+    if (this.accessEvents.length > InMemoryRepository.MAX_ACCESS_EVENTS) {
+      this.accessEvents.splice(0, this.accessEvents.length - InMemoryRepository.MAX_ACCESS_EVENTS);
+    }
+  }
+
+  async listAccessEvents(documentId: string): Promise<AccessEventRecord[]> {
+    return this.accessEvents.filter((e) => e.document_id === documentId);
   }
 }

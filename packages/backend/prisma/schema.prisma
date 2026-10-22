@@ -7,46 +7,89 @@ generator client {
   provider = "prisma-client-js"
 }
 
+enum DeviceStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum AccessAction {
+  SEAL
+  PAYLOAD_FETCH
+  DELETE
+}
+
+enum AccessOutcome {
+  GRANTED
+  DENIED
+}
+
 model Organization {
-  id        String     @id @default(uuid())
-  api_key   String     @unique
-  name      String
-  createdAt DateTime   @default(now())
-  devices   Device[]
-  documents Document[]
+  id           String        @id @default(uuid())
+  api_key      String        @unique
+  name         String
+  createdAt    DateTime      @default(now())
+  devices      Device[]
+  documents    Document[]
+  accessEvents AccessEvent[]
 }
 
 model Device {
-  id            String       @id @default(uuid())
-  org_id        String
-  hardware_hash String       // Hashed combination of MAC, CPU ID, etc.
-  public_key    String       // PEM format (RSA-OAEP 2048 SPKI)
-  status        String       @default("ACTIVE") // ACTIVE, REVOKED
-  metadata      Json?
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
-  organization  Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
-  documents     Document[]
+  id                     String       @id @default(uuid())
+  org_id                 String
+  hardware_hash          String       // SHA-256 of device traits; informational, NOT an identity (may collide)
+  public_key             String       // PEM format (RSA 2048+ SPKI)
+  public_key_fingerprint String       // SHA-256 hex of DER SPKI; device identity within an org
+  key_algorithm          String       @default("RSA-OAEP-256") // RSA-OAEP-256 | RSA-OAEP-256-MGF1-SHA1
+  status                 DeviceStatus @default(ACTIVE)
+  metadata               Json?
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+  organization           Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  documents              Document[]
 
-  @@unique([org_id, hardware_hash])
-  @@index([hardware_hash])
+  // A public key can be registered only once per org and is immutable afterwards.
+  @@unique([org_id, public_key_fingerprint])
+  @@index([org_id, hardware_hash])
 }
 
 model Document {
-  id               String       @id @default(uuid())
-  org_id           String
-  target_device_id String
-  encrypted_dek    String       // AES-256 key encrypted with Device RSA-OAEP Public Key (Base64)
-  iv               String       // 12-byte GCM initialization vector (Base64)
-  auth_tag         String       // 16-byte GCM authentication tag (Base64)
-  storage_url      String       // S3 / storage path to AES-encrypted file
-  original_name    String?
-  mime_type        String       @default("application/octet-stream")
-  size_bytes       Int?
-  createdAt        DateTime     @default(now())
-  organization     Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
-  target_device    Device       @relation(fields: [target_device_id], references: [id], onDelete: Restrict)
+  id                   String       @id @default(uuid())
+  org_id               String
+  target_device_id     String
+  encrypted_dek        String       // AES-256 key wrapped with the device public key (Base64)
+  iv                   String       // 12-byte GCM initialization vector (Base64)
+  auth_tag             String       // 16-byte GCM authentication tag (Base64)
+  storage_url          String       // Storage path to the AES-encrypted blob
+  original_name        String?
+  mime_type            String       @default("application/octet-stream")
+  encrypted_size_bytes Int?         // ciphertext size (plaintext + 16-byte tag)
+  aad_version          String       @default("v2") // v1: device id | v2: device id + document id + MIME
+  key_algorithm        String       @default("RSA-OAEP-256")
+  expires_at           DateTime?
+  createdAt            DateTime     @default(now())
+  organization         Organization @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  target_device        Device       @relation(fields: [target_device_id], references: [id], onDelete: Restrict)
 
   @@index([target_device_id])
   @@index([org_id])
+  @@index([expires_at])
+}
+
+/// Append-only audit trail. Not linked to Document so events survive document deletion.
+model AccessEvent {
+  id           String        @id @default(uuid())
+  org_id       String
+  document_id  String?
+  device_id    String?
+  action       AccessAction
+  outcome      AccessOutcome
+  reason       String?
+  ip           String?
+  user_agent   String?
+  request_id   String?
+  createdAt    DateTime      @default(now())
+  organization Organization  @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, createdAt])
+  @@index([document_id])
 }

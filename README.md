@@ -1,159 +1,134 @@
-# DocBind — Device-Bound Document Security API & SDK
+# DocBind
 
-Zero-Knowledge, Envelope-Encrypted File Security API (`@secure-doc/backend`) and Client SDK (`@secure-doc/sdk` for React Native & Web) that locks sensitive files of any type (PDF, Office documents, images, video, audio, text) to a specific target device's hardware fingerprint and decrypts them strictly in application RAM (`Uint8Array`) without ever writing plaintext bytes to disk.
+Device-bound document delivery with server-side AES-256-GCM envelope encryption and a React / React Native SDK. Each document targets one immutable device public key. The corresponding private key decrypts its document key.
 
----
+## Security model
 
-## 1. Cryptographic Architecture (Envelope Encryption)
+- The server receives plaintext while sealing. This is **server-side envelope encryption**, not zero-knowledge or end-to-end encryption.
+- Device identity is `(organization, SHA-256 of DER SPKI public key)`. Public keys cannot be replaced. Re-enrolling a revoked key is denied. A different key always creates a different device ID.
+- `hardware_hash` is optional diagnostic information. Display changes, browser zoom, time zone changes and identical hardware cannot replace a device record or change its identity. Neither the hash nor a client-supplied device ID authenticates a request.
+- Android requires a hardware-backed RSA key; unsupported devices fail rather than fall back to software. The SDK advertises OAEP-SHA256 with MGF1-SHA1 for Android Keystore compatibility.
+- iOS uses RSA in Keychain with `WhenUnlockedThisDeviceOnly`, **not Secure Enclave**. Web uses a non-extractable WebCrypto key in IndexedDB. Neither provides a server-verified physical-device guarantee. Hardware attestation is not implemented.
+- A bearer token grants access only to one active device's encrypted payloads. Decryption still requires its private key. Device tokens cannot seal documents, issue enrollments or revoke devices.
+- Revocation blocks future API requests. It cannot erase plaintext or encrypted payloads and keys already obtained by a recipient. Losing or deleting the private key makes old documents unrecoverable.
+- Screenshot controls are best effort. iOS detects recording/mirroring; Web cannot reliably prevent OS capture. RAM buffers are cleared where possible, but JavaScript/OS copies, swap and browser internals prevent an absolute “never touches disk” guarantee.
 
-1. **Client-Side Key Generation (`DocumentSealer.getDeviceToken()`)**:
-   - Generates an asymmetric `RSA-OAEP 2048` (`SHA-256`) key pair on the target device.
-   - **Private Key Protection**:
-     - **Web**: Stored in IndexedDB as a non-extractable WebCrypto `CryptoKey` (`extractable: false`), preventing raw private key export.
-     - **Mobile (React Native)**: Stored inside the iOS Keychain / Secure Enclave or Android Keystore (`AndroidKeyStore`).
-   - Computes a deterministic 64-character `SHA-256` `hardware_hash` from device hardware signals (`react-native-device-info` on Mobile or WebGL GPU / CPU / Screen traits on Web).
-   - Registers `{ device_id, hardware_hash, public_key, metadata }` with `POST /v1/devices/register`.
+## Install and verify
 
-2. **Document Sealing (`POST /v1/documents/seal`)**:
-   - Generates a unique 256-bit `AES-256-GCM` Data Encryption Key (`DEK`) and 96-bit `IV` per document.
-   - Accepts any file type and resolves its MIME type (magic bytes → declared type → file extension → `application/octet-stream`).
-   - Encrypts the file in memory (`multer.memoryStorage()`) with `AES-256-GCM`, binding `target_device_id` as Additional Authenticated Data (`AAD`).
-   - Wraps the `DEK` using the target device's `RSA-OAEP-256` Public Key.
-   - Zeroes out the ephemeral `DEK` and plaintext upload buffer (`Buffer.fill(0)`) immediately after sealing.
+Use Node.js 22.18+ (or a supported newer release) and npm. The lockfile is committed; generated builds and dependencies are ignored.
 
-3. **In-Memory Decryption & Secure Viewing (`<DocumentSealer.Viewer />`)**:
-   - Fetches the encrypted payload from `GET /v1/documents/:id/payload`.
-   - Unwraps the `encrypted_dek` into a non-extractable `AES-GCM` `CryptoKey` in RAM using `crypto.subtle.unwrapKey` (or native hardware keystore).
-   - Decrypts the file into an in-memory `Uint8Array` and wipes the buffer (`bytes.fill(0)`) on component unmount.
-   - Enforces anti-screenshot protections (`WindowManager.LayoutParams.FLAG_SECURE` on Android, `UIScreen.capturedDidChangeNotification` on iOS, focus/shortcut/print guards on Web) and renders a dynamic diagonal watermark grid.
+```bash
+npm ci
+npm run prisma:generate --workspace=packages/backend
+npm run build
+npm test
+```
 
-### Supported File Types
+Prisma generation downloads native engines when absent. API regression tests use real Express/body parsing/Multer with an in-process HTTP transport, so they do not require a listening port. Persistent storage tests mock provider clients; they do not replace integration tests against a real PostgreSQL database and S3 bucket. Native projects must also be built/tested in an Android/iOS host app.
 
-| Category | Examples | Web rendering (`<DocumentSealer.Viewer />`) |
-|---|---|---|
-| PDF | `application/pdf` | Text layer or `<object>` (in-memory Blob URL) |
-| Image | `image/png`, `image/jpeg`, `image/webp`, `image/gif` | `<img>` (drag & context menu disabled) |
-| Video | `video/mp4`, `video/webm`, `video/quicktime` | `<video>` (`nodownload`, PiP disabled) |
-| Audio | `audio/mpeg`, `audio/wav`, `audio/ogg` | `<audio>` (`nodownload`) |
-| Text | `text/*`, `application/json`, `text/csv` | `<pre>` |
-| Other | Office (`docx`, `xlsx`, `pptx`), archives, ... | Encrypted & delivered; supply a renderer via `renderNative` |
+## Server configuration
 
-### Size Limits
+Set environment variables before starting the backend; `.env` files are not automatically loaded.
 
-Files are encrypted as a single AES-GCM block, so the whole file is decrypted in client RAM (peak usage is roughly **4–5× the file size**: base64 JSON + ciphertext + plaintext + Blob copy). Limits are therefore enforced on both sides:
+| Variable | Meaning |
+| --- | --- |
+| `NODE_ENV=production` | Requires PostgreSQL, S3 and a persistent token-signing secret; refuses memory fallback |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `S3_BUCKET_NAME` | Existing private bucket for ciphertext |
+| `AWS_REGION` | S3 region; defaults to `us-east-1` |
+| `S3_ENDPOINT` | Optional S3-compatible endpoint; enables path-style requests |
+| `TOKEN_SIGNING_SECRET` | Random secret of at least 32 bytes; persist across restarts; rotation invalidates existing tokens |
+| `PROVISIONING_API_KEY` | Separate secret for organization creation; absent means onboarding is disabled |
+| `CORS_ORIGINS` | Comma-separated browser app origins; cross-origin access is disabled by default |
+| `PORT` | Defaults to `4000` |
+| `MAX_UPLOAD_MB` / `MAX_VIDEO_MB` | Non-media/media upload limits; defaults to 50/100 MiB |
 
-| Layer | Video / Audio | Other files | Configure |
-|---|---|---|---|
-| Backend (`POST /v1/documents/seal`) | 100 MB | 50 MB | `MAX_VIDEO_MB`, `MAX_UPLOAD_MB` env vars |
-| SDK (before decrypt) | 100 MB | 50 MB | `DocumentSealer.configure({ maxDecryptBytes })` |
+AWS credentials use the standard provider chain. Grant the backend bucket-scoped read/write/delete permissions. Keep database, AWS, provisioning and organization credentials on the trusted server.
 
-- The backend returns **`413`** with `{ mime_type, max_bytes }` when a file exceeds its category limit.
-- `GET /v1/documents/:id/payload` returns `size_bytes` and the `X-DocBind-Size-Bytes` / `X-DocBind-Mime-Type` headers, so the SDK rejects oversize payloads **before buffering the body** and throws `DocumentTooLargeError`.
+```bash
+npm run prisma:deploy --workspace=packages/backend
+npm run build
+npm run start --workspace=packages/backend
+```
+
+Without persistence settings in development, adapters store data in RAM and lose it on restart. There is no seeded organization, default API key or authentication fallback. Startup warnings identify memory mode. Production needs an existing bucket, database, TLS ingress and shared rate limiting at the ingress for multiple replicas. The built-in rate limit is per process (120 requests/minute/IP); it does not trust forwarded IP headers. Authenticated uploads are limited to two concurrent buffers per process; configure ingress body limits, timeouts and quotas too.
+
+### Existing PostgreSQL installations
+
+Back up first. If the database already has exactly the old published schema but no migration history, baseline it once:
+
+```bash
+npm exec --workspace=packages/backend -- prisma migrate resolve --applied 202610220001_legacy_baseline
+npm run prisma:deploy --workspace=packages/backend
+```
+
+For a fresh database, run only `prisma:deploy`; it applies both migrations. The upgrade preserves old IDs, ciphertext, revoked status and legacy v1 AAD. It aborts on duplicate keys within a tenant or unsupported key encodings instead of silently changing bindings. Resolve such records explicitly before retrying. Do not baseline an empty or differently structured database. Previously in-memory data cannot be recovered after its process has stopped.
+
+## Authentication and enrollment
+
+There are three distinct credentials:
+
+1. **Provisioning key**, sent as `x-provisioning-key` to `POST /v1/organizations`. It returns a new organization and its random API key.
+2. **Organization API key**, sent as `x-api-key` by your trusted application server for device approval, document sealing and revocation. Never embed it in a browser/mobile app.
+3. **Scoped bearer tokens**, used by client SDKs. An enrollment token expires after five minutes and approves one public-key fingerprint. Registration returns a device token valid for one hour. Device-token renewal via registration requires a still-active, unexpired token; otherwise ask the trusted application server for a new enrollment approval.
+
+Your application server must authenticate its own user and authorize the requested device before issuing an enrollment token. DocBind does not supply your application's login system.
+
+| Endpoint | Credential | Purpose |
+| --- | --- | --- |
+| `POST /v1/organizations` | Provisioning key | Create tenant; JSON `{ "name": "Company" }` |
+| `POST /v1/devices/enrollment-tokens` | Organization key | Approve public key; JSON `{ "public_key": "PEM" }`; returns `enrollment_token` |
+| `POST /v1/devices/register` | Enrollment/device bearer or organization key | Register immutable key; returns `registered_device_id`, `device_token`, `status`, `expires_in` |
+| `GET /v1/devices/:id` | Organization key or matching device bearer | Device status and metadata; no hash |
+| `POST /v1/devices/:id/revoke` | Organization key | Permanently revoke that key within its organization |
+| `POST /v1/documents/seal` | Organization key | Multipart `file` + `target_device_id`, or JSON `file_base64` + `target_device_id` |
+| `GET /v1/documents/:id/payload` | Matching active device bearer | Ciphertext and wrapped DEK; admin keys cannot fetch this endpoint |
+
+New envelopes authenticate device ID, document ID and MIME type (AAD v2). Legacy v1 envelopes remain readable. Registration accepts `key_algorithm` (`RSA-OAEP-256` or Android's `RSA-OAEP-256-MGF1-SHA1`); this value is immutable after enrollment.
+
+## Client SDK
 
 ```ts
-DocumentSealer.configure({
-  apiUrl: 'https://api.example.com',
-  // number = single limit for all types, or per category:
-  maxDecryptBytes: { media: 60 * 1024 * 1024, default: 30 * 1024 * 1024 }, // e.g. stricter on low-end phones
-});
-```
-
----
-
-## 2. Project Structure
-
-- [`packages/backend`](./packages/backend): Node.js + TypeScript + Express + Prisma API
-  - [`src/crypto/envelope.ts`](./packages/backend/src/crypto/envelope.ts): `AES-256-GCM` + `RSA-OAEP-256` Envelope Encryption service
-  - [`src/routes/devices.ts`](./packages/backend/src/routes/devices.ts): `POST /v1/devices/register`, `POST /v1/devices/:id/revoke`, `GET /v1/devices/:id`
-  - [`src/routes/documents.ts`](./packages/backend/src/routes/documents.ts): `POST /v1/documents/seal`, `GET /v1/documents/:id/payload`
-  - [`src/utils/mime.ts`](./packages/backend/src/utils/mime.ts): MIME detection (magic bytes / extension) & per-category size limits (`MAX_UPLOAD_MB`, `MAX_VIDEO_MB`)
-  - [`prisma/schema.prisma`](./packages/backend/prisma/schema.prisma): `Organization`, `Device`, and `Document` models
-- [`packages/sdk`](./packages/sdk): React & React Native Client SDK (`@secure-doc/sdk`)
-  - [`src/DocumentSealer.ts`](./packages/sdk/src/DocumentSealer.ts): `DocumentSealer.getDeviceToken()`, `DocumentSealer.fetchAndDecryptInMemory()`
-  - [`src/components/Viewer.tsx`](./packages/sdk/src/components/Viewer.tsx): `<DocumentSealer.Viewer />` component with MIME-aware rendering, RAM-only lifecycle & watermark overlay
-  - [`src/media.ts`](./packages/sdk/src/media.ts): `getMediaCategory()` MIME → renderer category helper
-  - [`src/crypto/KeyStore.ts`](./packages/sdk/src/crypto/KeyStore.ts): WebCrypto (`extractable: false`) & Mobile Hardware Keystore key management
-  - [`src/fingerprint/HardwareFingerprint.ts`](./packages/sdk/src/fingerprint/HardwareFingerprint.ts): Deterministic SHA-256 device fingerprinting
-  - [`src/security/ScreenCaptureGuard.ts`](./packages/sdk/src/security/ScreenCaptureGuard.ts): Cross-platform screenshot & screen recording countermeasures
-  - [`native/android/DocBindModule.kt`](./packages/sdk/native/android/DocBindModule.kt) & [`native/ios/DocBindModule.swift`](./packages/sdk/native/ios/DocBindModule.swift): Native Mobile modules
-
----
-
-## 3. Quick Start
-
-```bash
-# Install dependencies
-npm install
-
-# Build Backend & SDK packages
-npm run build
-
-# Run Cryptographic & E2E Test Suites
-npm test
-
-# Start Backend API Server (defaults to http://localhost:4000)
-npm run dev:backend
-```
-
-### SDK Usage Example
-
-```tsx
-import React, { useEffect, useState } from 'react';
 import { DocumentSealer } from '@secure-doc/sdk';
 
+DocumentSealer.configure({ apiUrl: 'https://docbind.example.com' });
+// This creates/retrieves the local private key without contacting DocBind.
+const local = await DocumentSealer.getDeviceToken({ skipBackendRegistration: true });
+
+// Send local.publicKeyPem to YOUR authenticated application server. That server
+// authorizes this user/device, calls /v1/devices/enrollment-tokens with its
+// organization key, and returns only the scoped enrollment_token.
+const enrollmentToken = await obtainApprovalFromYourApplication(local.publicKeyPem);
+DocumentSealer.configure({ enrollmentToken });
+const device = await DocumentSealer.getDeviceToken({ forceRefresh: true });
+
+// Your application server seals a document for device.deviceId and supplies its URL.
+const document = await DocumentSealer.fetchAndDecryptInMemory(
+  'https://docbind.example.com/v1/documents/DOCUMENT_ID/payload'
+);
+try { useDocument(document.bytes); } finally { document.dispose(); }
+```
+
+Persist `device.deviceToken` only in suitable platform-protected storage if needed. Pass it back as `deviceToken` on subsequent app launches. Tokens are not private keys. Clearing IndexedDB or reinstalling an app may destroy the key; another key cannot recover prior envelopes.
+
+For the React viewer, pass `deviceToken` rather than the old `apiKey` prop. The SDK never sends an organization key and refuses payload URLs on a different origin from configured `apiUrl`.
+
+### React Native
+
+The SDK includes a podspec, Android library/package and autolinking configuration. Install pods for the host iOS app. Register these adapters explicitly (the native module is not loaded automatically by the framework-neutral SDK):
+
+```ts
+import { NativeModules, NativeEventEmitter } from 'react-native';
+import { DocumentSealer, createReactNativeKeystore, createReactNativeScreenGuard } from '@secure-doc/sdk';
+
+const module = NativeModules.DocBindScreenGuard;
 DocumentSealer.configure({
-  apiUrl: 'http://localhost:4000',
-  apiKey: 'docbind_dev_api_key_2026',
+  apiUrl: 'https://docbind.example.com',
+  nativeModules: {
+    secureKeystore: createReactNativeKeystore(module),
+    screenGuard: createReactNativeScreenGuard(module, new NativeEventEmitter(module)),
+  },
 });
-
-export function ConfidentialDocumentScreen({ documentId }: { documentId: string }) {
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    DocumentSealer.getDeviceToken().then(( { deviceId }) => {
-      console.log('Registered Hardware Device ID:', deviceId);
-      setReady(true);
-    });
-  }, []);
-
-  if (!ready) return <div>Initializing Hardware Enclave...</div>;
-
-  return (
-    <DocumentSealer.Viewer
-      payloadUrl={`http://localhost:4000/v1/documents/${documentId}/payload`}
-      preventScreenshot={true}
-      watermark={{ text: 'user@192.168.1.10', color: 'rgba(0,0,0,0.1)' }}
-    />
-  );
-}
 ```
 
-### Sealing Files
-
-```bash
-# Multipart upload (any file type)
-curl -X POST http://localhost:4000/v1/documents/seal \
-  -H "x-api-key: docbind_dev_api_key_2026" \
-  -F target_device_id=<DEVICE_ID> \
-  -F file=@./training-video.mp4
-
-# JSON / base64 upload (mime_type optional — detected from content/filename if omitted)
-curl -X POST http://localhost:4000/v1/documents/seal \
-  -H "x-api-key: docbind_dev_api_key_2026" -H "Content-Type: application/json" \
-  -d '{"target_device_id":"<DEVICE_ID>","filename":"photo.png","mime_type":"image/png","file_base64":"..."}'
-```
-
-### Custom / Native Rendering
-
-Use `renderNative` (React Native or unsupported formats such as Office files). It receives the decrypted data in RAM only:
-
-```tsx
-<DocumentSealer.Viewer
-  payloadUrl={payloadUrl}
-  renderNative={({ bytes, base64InMemory, mimeType, category }) =>
-    category === 'video' ? <MyNativeVideo base64={base64InMemory} /> : <MyNativePdf base64={base64InMemory} />
-  }
-/>
-```
-
-> `renderNativePdf` is still accepted as a deprecated alias of `renderNative`.
+On Android pass only `createReactNativeScreenGuard(module)`; capture event subscription is for iOS. Native constants select the matching OAEP variant. Android exports `getPublicKeyPem` for subsequent launches; iOS exports promise-based key and capture methods and emits boolean capture events. These modules require a compatible React Native host and device validation before release.
