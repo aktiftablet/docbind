@@ -1,0 +1,53 @@
+# Dependencies and generated builds (all workspaces)
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Tests and tool caches
+coverage/
+.nyc_output/
+.vitest/
+.vite/
+.cache/
+.turbo/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+.aws/
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Native build artifacts and local SDK settings
+.gradle/
+.cxx/
+local.properties
+Pods/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
