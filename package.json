@@ -16,8 +16,10 @@
     "envelope-encryption",
     "drm",
     "pdf-security",
-    "device-binding",
-    "zero-knowledge"
+    "device-binding"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": "^22.18.0 || ^24.0.0 || >=26.0.0"
+  }
 }

@@ -51,7 +51,7 @@ function extractInMemoryPdfSummary(bytes: Uint8Array): {
  * `<DocumentSealer.Viewer />`
  *
  * Security guarantees:
- * 1. **Zero Disk Writes**: Fetches the encrypted payload, unwraps the AES-256-GCM DEK via the
+ * 1. **In-memory processing**: Fetches the encrypted payload, unwraps the AES-256-GCM DEK via the
  *    device's hardware/non-extractable RSA-OAEP private key, and holds the decrypted `Uint8Array`
  *    strictly in application memory (`RAM`), wiping (`bytes.fill(0)`) on unmount.
  * 2. **Anti-Screenshot & Screen Capture Protection**:
@@ -65,7 +65,7 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
   payloadUrl,
   preventScreenshot = true,
   watermark,
-  apiKey,
+  deviceToken,
   onDocumentLoaded,
   onError,
   onSecurityViolation,
@@ -111,7 +111,7 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
     setLoading(true);
     setError(null);
 
-    DocumentSealer.fetchAndDecryptInMemory(payloadUrl, apiKey)
+    DocumentSealer.fetchAndDecryptInMemory(payloadUrl, deviceToken)
       .then((doc) => {
         if (!active) {
           doc.dispose();
@@ -141,7 +141,7 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
         currentDoc.dispose();
       }
     };
-  }, [payloadUrl, apiKey]);
+  }, [payloadUrl, deviceToken]);
 
   const category: MediaCategory | null = decryptedDoc
     ? getMediaCategory(decryptedDoc.mimeType)
@@ -163,7 +163,7 @@ export const SecureDocumentViewer: React.FC<SecureViewerProps> = ({
     return bytesToBase64(decryptedDoc.bytes);
   }, [decryptedDoc, nativeRenderer]);
 
-  // In-memory object URL (Blob lives in RAM, never written to disk). Revoked on unmount.
+  // Object URL is revoked on unmount; browser/OS backing storage is outside SDK control.
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   useEffect(() => {
     if (!decryptedDoc || nativeRenderer || category === 'text') {

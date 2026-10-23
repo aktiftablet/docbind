@@ -1,278 +1,189 @@
 import crypto from 'node:crypto';
-import request from 'supertest';
-import { describe, it, expect, beforeAll } from 'vitest';
+import request from './request.js';
+import { describe, it, expect, vi } from 'vitest';
 import { createApp } from '../src/app.js';
-import { EnvelopeCryptoService } from '../src/crypto/envelope.js';
+import { EnvelopeCryptoService as Crypto } from '../src/crypto/envelope.js';
+import { InMemoryRepository, PrismaRepository } from '../src/db/repository.js';
+import { TokenService } from '../src/middleware/auth.js';
+import { S3EncryptedStorage } from '../src/storage/storage.js';
 import { resolveMimeType } from '../src/utils/mime.js';
 
-function generateTestRsaKeyPair(modulusLength = 2048): {
-  publicKeyPem: string;
-  privateKeyPem: string;
-} {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
-    modulusLength,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-  return { publicKeyPem: publicKey, privateKeyPem: privateKey };
+function keypair(bits = 2048) {
+  return crypto.generateKeyPairSync('rsa', { modulusLength: bits, publicKeyEncoding: { type: 'spki', format: 'pem' }, privateKeyEncoding: { type: 'pkcs8', format: 'pem' } });
+}
+const keys = keypair(), attacker = keypair();
+async function fixture(options: Parameters<typeof createApp>[0] = {}) {
+  const context = createApp({ tokenSecret: 't'.repeat(48), provisioningKey: 'provision-secret', ...options });
+  const org = await context.repository.createOrganization('Test organization');
+  const register = (publicKey = keys.publicKey, hash = 'same-hardware', algorithm = 'RSA-OAEP-256') => request(context.app)
+    .post('/v1/devices/register').set('x-api-key', org.api_key)
+    .send({ public_key: publicKey, hardware_hash: hash, key_algorithm: algorithm });
+  const seal = (id: string, content = Buffer.from('%PDF-1.7 confidential')) => request(context.app)
+    .post('/v1/documents/seal').set('x-api-key', org.api_key)
+    .field('target_device_id', id).attach('file', content, 'private.pdf');
+  return { ...context, org, register, seal };
 }
 
-describe('DocBind Backend - Cryptographic Architecture & REST API', () => {
-  let deviceKeyPair: { publicKeyPem: string; privateKeyPem: string };
-  let secondDeviceKeyPair: { publicKeyPem: string; privateKeyPem: string };
-
-  beforeAll(() => {
-    deviceKeyPair = generateTestRsaKeyPair(2048);
-    secondDeviceKeyPair = generateTestRsaKeyPair(2048);
+describe('Authentication and scoped credentials', () => {
+  it('rejects missing, invalid, old development and malformed bearer credentials before parsing JSON', async () => {
+    const { app } = createApp();
+    for (const headers of [{}, { 'x-api-key': 'docbind_dev_api_key_2026' }, { authorization: 'Bearer nonsense' }]) {
+      await request(app).post('/v1/devices/register').set(headers).set('Content-Type', 'application/json').send('{invalid').expect(401);
+    }
+    await request(app).post('/v1/organizations').send({ name: 'Anonymous' }).expect(401);
   });
-
-  describe('EnvelopeCryptoService (AES-256-GCM + RSA-OAEP-256)', () => {
-    it('seals and unseals a PDF buffer in memory with AAD hardware device binding', () => {
-      const samplePdf = Buffer.from(
-        '%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nstream\nBT (Top Secret M&A Contract) Tj ET\nendstream\n%%EOF',
-        'utf-8'
-      );
-      const targetDeviceId = 'device-uuid-1234';
-
-      const sealed = EnvelopeCryptoService.sealDocument(
-        samplePdf,
-        deviceKeyPair.publicKeyPem,
-        targetDeviceId
-      );
-
-      expect(sealed.encryptedDek).toBeTruthy();
-      expect(sealed.iv).toBeTruthy();
-      expect(sealed.authTag).toBeTruthy();
-      expect(sealed.encryptedDocument.equals(samplePdf)).toBe(false);
-
-      const unsealed = EnvelopeCryptoService.unsealDocument(
-        sealed.encryptedDocument,
-        sealed.encryptedDek,
-        sealed.iv,
-        deviceKeyPair.privateKeyPem,
-        targetDeviceId
-      );
-
-      expect(unsealed.equals(samplePdf)).toBe(true);
-    });
-
-    it('fails decryption if targetDeviceId AAD is mismatched or another device private key is used', () => {
-      const samplePdf = Buffer.from('%PDF-1.7 Confidential Payload', 'utf-8');
-      const sealed = EnvelopeCryptoService.sealDocument(
-        samplePdf,
-        deviceKeyPair.publicKeyPem,
-        'authorized-device-id'
-      );
-
-      // Wrong targetDeviceId (AAD mismatch)
-      expect(() =>
-        EnvelopeCryptoService.unsealDocument(
-          sealed.encryptedDocument,
-          sealed.encryptedDek,
-          sealed.iv,
-          deviceKeyPair.privateKeyPem,
-          'spoofed-device-id'
-        )
-      ).toThrow();
-
-      // Wrong device private key
-      expect(() =>
-        EnvelopeCryptoService.unsealDocument(
-          sealed.encryptedDocument,
-          sealed.encryptedDek,
-          sealed.iv,
-          secondDeviceKeyPair.privateKeyPem,
-          'authorized-device-id'
-        )
-      ).toThrow();
-    });
-
-    it('rejects weak RSA keys (< 2048 bits) or malformed PEM strings', () => {
-      const weakKeys = generateTestRsaKeyPair(1024);
-      expect(() => EnvelopeCryptoService.validateRsaPublicKey(weakKeys.publicKeyPem)).toThrow(
-        /below minimum 2048 bits/
-      );
-      expect(() => EnvelopeCryptoService.validateRsaPublicKey('not-a-pem-key')).toThrow(
-        /Invalid device public key/
-      );
-    });
+  it('requires a separate provisioning key and validates tenant names', async () => {
+    const { app } = await fixture();
+    await request(app).post('/v1/organizations').set('x-provisioning-key', 'wrong').send({ name: 'x' }).expect(401);
+    await request(app).post('/v1/organizations').set('x-provisioning-key', 'provision-secret').send({ name: ' ' }).expect(400);
+    const res = await request(app).post('/v1/organizations').set('x-provisioning-key', 'provision-secret').send({ name: 'New tenant' }).expect(201);
+    expect(res.body.organization.api_key).toMatch(/^db_live_/);
   });
-
-  describe('REST Endpoints (/v1/devices/register, /v1/documents/seal, /v1/documents/:id/payload)', () => {
-    it('executes full device registration, multipart PDF sealing, and authorized payload retrieval', async () => {
-      const { app } = createApp();
-      const rawFingerprint = 'ios|iPhone16,2|arm64|unique-hw-id-998877';
-
-      // 1. Register Device
-      const regRes = await request(app)
-        .post('/v1/devices/register')
-        .send({
-          device_id: rawFingerprint,
-          public_key: deviceKeyPair.publicKeyPem,
-          metadata: { os: 'iOS 18.0', model: 'iPhone 16 Pro' },
-        })
-        .expect(201);
-
-      expect(regRes.body.success).toBe(true);
-      expect(regRes.body.registered_device_id).toBeTypeOf('string');
-      expect(regRes.body.hardware_hash).toMatch(/^[a-f0-9]{64}$/);
-
-      const registeredDeviceId = regRes.body.registered_device_id as string;
-      const hardwareHash = regRes.body.hardware_hash as string;
-
-      // 2. Seal Document via multipart/form-data
-      const plaintextPdf = Buffer.from(
-        '%PDF-1.7\nBT (Board Resolution - Strictly Confidential) Tj ET\n%%EOF',
-        'utf-8'
-      );
-
-      const sealRes = await request(app)
-        .post('/v1/documents/seal')
-        .field('target_device_id', registeredDeviceId)
-        .attach('file', plaintextPdf, 'board-resolution.pdf')
-        .expect(201);
-
-      expect(sealRes.body.success).toBe(true);
-      expect(sealRes.body.document_id).toBeTypeOf('string');
-      expect(sealRes.body.target_device_id).toBe(registeredDeviceId);
-      expect(sealRes.body.encrypted_dek).toBeTypeOf('string');
-      expect(sealRes.body.encrypted_document).toBeTypeOf('string');
-
-      const documentId = sealRes.body.document_id as string;
-
-      // 3. Fetch Encrypted Payload for Authorized Device
-      const payloadRes = await request(app)
-        .get(`/v1/documents/${documentId}/payload`)
-        .set('x-device-id', registeredDeviceId)
-        .set('x-hardware-hash', hardwareHash)
-        .expect(200);
-
-      expect(payloadRes.body.success).toBe(true);
-      expect(payloadRes.body.document_id).toBe(documentId);
-      expect(payloadRes.body.encrypted_dek).toBe(sealRes.body.encrypted_dek);
-
-      // Verify target device can decrypt the fetched payload in RAM
-      const decryptedBuffer = EnvelopeCryptoService.unsealDocument(
-        Buffer.from(payloadRes.body.encrypted_document, 'base64'),
-        payloadRes.body.encrypted_dek,
-        payloadRes.body.iv,
-        deviceKeyPair.privateKeyPem,
-        registeredDeviceId
-      );
-      expect(decryptedBuffer.toString('utf-8')).toBe(plaintextPdf.toString('utf-8'));
-
-      // 4. Reject Unauthorized Hardware Fingerprint on Payload Fetch
-      await request(app)
-        .get(`/v1/documents/${documentId}/payload`)
-        .set('x-hardware-hash', '0000000000000000000000000000000000000000000000000000000000000000')
-        .expect(403);
-
-      // 5. Revoke Device & Verify Payload Access is Blocked
-      await request(app)
-        .post(`/v1/devices/${registeredDeviceId}/revoke`)
-        .expect(200);
-
-      await request(app)
-        .get(`/v1/documents/${documentId}/payload`)
-        .expect(403);
-    });
-
-    it('seals non-PDF files (image, video) and resolves MIME types from content', async () => {
-      const { app } = createApp();
-      const regRes = await request(app)
-        .post('/v1/devices/register')
-        .send({ device_id: 'android|pixel|multi-format', public_key: deviceKeyPair.publicKeyPem })
-        .expect(201);
-      const deviceId = regRes.body.registered_device_id as string;
-      const hardwareHash = regRes.body.hardware_hash as string;
-
-      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
-      const mp4 = Buffer.concat([
-        Buffer.from([0, 0, 0, 0x18]),
-        Buffer.from('ftypisom', 'latin1'),
-        Buffer.alloc(32, 7),
-      ]);
-
-      // Multipart image upload
-      const imgSeal = await request(app)
-        .post('/v1/documents/seal')
-        .field('target_device_id', deviceId)
-        .attach('file', png, 'photo.png')
-        .expect(201);
-
-      // Base64 JSON video upload without declared MIME -> sniffed from magic bytes
-      const vidSeal = await request(app)
-        .post('/v1/documents/seal')
-        .send({ target_device_id: deviceId, file_base64: mp4.toString('base64'), filename: 'clip.mp4' })
-        .expect(201);
-
-      for (const [seal, original, mime] of [
-        [imgSeal, png, 'image/png'],
-        [vidSeal, mp4, 'video/mp4'],
-      ] as const) {
-        const payload = await request(app)
-          .get(`/v1/documents/${seal.body.document_id}/payload`)
-          .set('x-device-id', deviceId)
-          .set('x-hardware-hash', hardwareHash)
-          .expect(200);
-        expect(payload.body.mime_type).toBe(mime);
-        const decrypted = EnvelopeCryptoService.unsealDocument(
-          Buffer.from(payload.body.encrypted_document, 'base64'),
-          payload.body.encrypted_dek,
-          payload.body.iv,
-          deviceKeyPair.privateKeyPem,
-          deviceId
-        );
-        expect(decrypted.equals(original)).toBe(true);
-      }
-    });
-
-    it('rejects files exceeding the per-category size limit with 413', async () => {
-      const { app } = createApp();
-      const regRes = await request(app)
-        .post('/v1/devices/register')
-        .send({ device_id: 'android|pixel|limit-test', public_key: deviceKeyPair.publicKeyPem })
-        .expect(201);
-      const deviceId = regRes.body.registered_device_id as string;
-
-      const prevVideo = process.env.MAX_VIDEO_MB;
-      const prevUpload = process.env.MAX_UPLOAD_MB;
-      process.env.MAX_VIDEO_MB = String(100 / (1024 * 1024)); // 100 bytes
-      process.env.MAX_UPLOAD_MB = String(1000 / (1024 * 1024)); // 1000 bytes
-      try {
-        const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom', 'latin1'), Buffer.alloc(200)]);
-        const res = await request(app)
-          .post('/v1/documents/seal')
-          .field('target_device_id', deviceId)
-          .attach('file', mp4, 'big.mp4')
-          .expect(413);
-        expect(res.body.mime_type).toBe('video/mp4');
-        expect(res.body.max_bytes).toBe(100);
-
-        // Same-size non-media file fits under MAX_UPLOAD_MB
-        await request(app)
-          .post('/v1/documents/seal')
-          .field('target_device_id', deviceId)
-          .attach('file', Buffer.alloc(200, 0x41), 'notes.txt')
-          .expect(201);
-      } finally {
-        if (prevVideo === undefined) delete process.env.MAX_VIDEO_MB;
-        else process.env.MAX_VIDEO_MB = prevVideo;
-        if (prevUpload === undefined) delete process.env.MAX_UPLOAD_MB;
-        else process.env.MAX_UPLOAD_MB = prevUpload;
-      }
-    });
+  it('binds enrollment to the approved public key and prevents client administrative operations', async () => {
+    const { app, org, register } = await fixture();
+    const approval = await request(app).post('/v1/devices/enrollment-tokens').set('x-api-key', org.api_key).send({ public_key: keys.publicKey }).expect(201);
+    const enroll = (pub: string) => request(app).post('/v1/devices/register').auth(approval.body.enrollment_token, { type: 'bearer' }).send({ public_key: pub });
+    await enroll(attacker.publicKey).expect(403);
+    const reg = await enroll(keys.publicKey).expect(201);
+    const other = await register(attacker.publicKey);
+    const client = () => request(app).post(`/v1/devices/${other.body.registered_device_id}/revoke`).auth(reg.body.device_token, { type: 'bearer' });
+    await client().expect(403);
+    await request(app).post('/v1/documents/seal').auth(reg.body.device_token, { type: 'bearer' }).send({}).expect(403);
+    await request(app).post('/v1/devices/enrollment-tokens').auth(reg.body.device_token, { type: 'bearer' }).send({ public_key: attacker.publicKey }).expect(403);
+    await request(app).get(`/v1/devices/${other.body.registered_device_id}`).auth(reg.body.device_token, { type: 'bearer' }).expect(404);
+    await request(app).post('/v1/devices/register').auth(reg.body.device_token, { type: 'bearer' }).send({ public_key: attacker.publicKey }).expect(403);
   });
+  it('rejects expired and modified tokens', () => {
+    const signer = new TokenService('s'.repeat(48));
+    expect(signer.verify(signer.issue('device', 'org', 'device', -1))).toBeNull();
+    const valid = signer.issue('device', 'org', 'device');
+    expect(signer.verify(valid + 'x')).toBeNull();
+    expect(signer.verify(valid)?.subject).toBe('device');
+    expect(new TokenService('b'.repeat(48)).verify(valid)).toBeNull();
+  });
+  it('limits anonymous requests and authenticated metadata bodies', async () => {
+    const limited = createApp({ rateLimit: 2 });
+    await request(limited.app).get('/health').expect(200);
+    await request(limited.app).get('/health').expect(200);
+    await request(limited.app).get('/health').expect(429);
+    const { app, org } = await fixture();
+    await request(app).post('/v1/devices/register').set('x-api-key', org.api_key).send({ metadata: 'x'.repeat(33000) }).expect(413);
+  });
+});
 
-  describe('MIME resolution', () => {
-    it('prefers magic bytes, then declared type, then extension', () => {
-      expect(resolveMimeType(Buffer.from('%PDF-1.7'), 'image/png')).toBe('application/pdf');
-      expect(resolveMimeType(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg');
-      expect(resolveMimeType(Buffer.from('PK\u0003\u0004'), undefined, 'report.docx')).toBe(
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-      );
-      expect(resolveMimeType(Buffer.from('hello'), 'application/octet-stream', 'notes.txt')).toBe('text/plain');
-      expect(resolveMimeType(Buffer.from('???'))).toBe('application/octet-stream');
-    });
+describe('Immutable device identity and document binding', () => {
+  it('does not reactivate revoked keys or let a copied hardware hash replace their ID/key', async () => {
+    const { app, org, register, seal, repository } = await fixture();
+    const first = await register();
+    const id = first.body.registered_device_id;
+    const old = await seal(id);
+    await request(app).post(`/v1/devices/${id}/revoke`).set('x-api-key', org.api_key).expect(200);
+    await register().expect(403);
+    const second = await register(attacker.publicKey).expect(201);
+    expect(second.body.registered_device_id).not.toBe(id);
+    expect((await repository.findDeviceById(id))?.public_key).toBe(keys.publicKey.trim());
+    expect((await repository.findDeviceById(id))?.status).toBe('REVOKED');
+    await seal(id).expect(403);
+    await request(app).get(`/v1/documents/${old.body.document_id}/payload`).auth(first.body.device_token, { type: 'bearer' }).expect(401);
+    await request(app).get(`/v1/documents/${old.body.document_id}/payload`).auth(second.body.device_token, { type: 'bearer' }).expect(403);
+    expect(() => Crypto.unsealDocument(Buffer.from(old.body.encrypted_document, 'base64'), old.body.encrypted_dek, old.body.iv, attacker.privateKey,
+      { targetDeviceId: id, documentId: old.body.document_id, mimeType: 'application/pdf' })).toThrow();
+  });
+  it('preserves identity when display/timezone/hash changes and never exposes the hash', async () => {
+    const { app, org, register } = await fixture();
+    const first = await register();
+    const again = await register(keys.publicKey, 'changed-monitor-and-timezone').expect(200);
+    expect(again.body.registered_device_id).toBe(first.body.registered_device_id);
+    const metadata = await request(app).get(`/v1/devices/${again.body.registered_device_id}`).set('x-api-key', org.api_key).expect(200);
+    expect(metadata.body.device.hardware_hash).toBeUndefined();
+    expect(again.body.hardware_hash).toBeUndefined();
+  });
+  it('delivers a v2 envelope only to its device, independently of spoofed headers', async () => {
+    const { app, org, register, seal } = await fixture();
+    const reg = await register(), other = await register(attacker.publicKey);
+    const id = reg.body.registered_device_id;
+    const sealed = await seal(id).expect(201);
+    const path = `/v1/documents/${sealed.body.document_id}/payload`;
+    await request(app).get(path).expect(401);
+    await request(app).get(path).set('x-api-key', org.api_key).expect(403);
+    await request(app).get(path).auth(other.body.device_token, { type: 'bearer' }).set('x-device-id', id).expect(403);
+    const payload = await request(app).get(path).auth(reg.body.device_token, { type: 'bearer' }).expect(200);
+    const binding = { targetDeviceId: id, documentId: sealed.body.document_id, mimeType: 'application/pdf' };
+    expect(payload.body.aad_version).toBe('v2');
+    expect(Crypto.unsealDocument(Buffer.from(payload.body.encrypted_document, 'base64'), payload.body.encrypted_dek, payload.body.iv, keys.privateKey, binding).toString()).toBe('%PDF-1.7 confidential');
+    expect(() => Crypto.unsealDocument(Buffer.from(payload.body.encrypted_document, 'base64'), payload.body.encrypted_dek, payload.body.iv, keys.privateKey, { ...binding, documentId: 'swapped' })).toThrow();
+  });
+  it('isolates organizations even with valid device credentials', async () => {
+    const f = await fixture();
+    const foreign = await f.repository.createOrganization('Foreign');
+    const reg = await f.register();
+    const sealed = await f.seal(reg.body.registered_device_id);
+    const other = await request(f.app).post('/v1/devices/register').set('x-api-key', foreign.api_key).send({ public_key: attacker.publicKey }).expect(201);
+    await request(f.app).get(`/v1/documents/${sealed.body.document_id}/payload`).auth(other.body.device_token, { type: 'bearer' }).expect(404);
+    await request(f.app).post(`/v1/devices/${reg.body.registered_device_id}/revoke`).set('x-api-key', foreign.api_key).expect(404);
+  });
+  it('rejects weak or invalid keys and changes to an enrolled algorithm', async () => {
+    const { register } = await fixture();
+    await register('invalid').expect(400);
+    await register(keypair(1024).publicKey).expect(400);
+    await register().expect(201);
+    await register(keys.publicKey, 'same-hardware', 'RSA-OAEP-256-MGF1-SHA1').expect(409);
+  });
+});
+
+describe('Encryption and resource controls', () => {
+  it.each(['RSA-OAEP-256', 'RSA-OAEP-256-MGF1-SHA1'] as const)('round trips %s, rejects wrong keys and authenticates metadata', algorithm => {
+    const binding = { targetDeviceId: 'device', documentId: 'document', mimeType: 'text/plain' };
+    const sealed = Crypto.sealDocument(Buffer.from('secret'), keys.publicKey, binding, algorithm);
+    expect(Crypto.unsealDocument(sealed.encryptedDocument, sealed.encryptedDek, sealed.iv, keys.privateKey, binding, algorithm).toString()).toBe('secret');
+    expect(() => Crypto.unsealDocument(sealed.encryptedDocument, sealed.encryptedDek, sealed.iv, attacker.privateKey, binding, algorithm)).toThrow();
+    expect(() => Crypto.unsealDocument(sealed.encryptedDocument, sealed.encryptedDek, sealed.iv, keys.privateKey, { ...binding, mimeType: 'image/png' }, algorithm)).toThrow();
+  });
+  it('applies category limits and rejects oversized multipart fields', async () => {
+    const f = await fixture(); const reg = await f.register();
+    vi.stubEnv('MAX_VIDEO_MB', String(100 / 1024 / 1024));
+    try {
+      const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(200)]);
+      await request(f.app).post('/v1/documents/seal').set('x-api-key', f.org.api_key).field('target_device_id', reg.body.registered_device_id).attach('file', mp4, 'video.mp4').expect(413);
+      await request(f.app).post('/v1/documents/seal').set('x-api-key', f.org.api_key).field('target_device_id', 'x'.repeat(9000)).expect(413);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('limits concurrent uploads before large body parsing', async () => {
+    const f = await fixture({ maxConcurrentUploads: 0 });
+    await request(f.app).post('/v1/documents/seal').set('x-api-key', f.org.api_key).send({}).expect(503);
+  });
+  it('rejects malformed multipart without crashing the server', async () => {
+    const f = await fixture();
+    await request(f.app).post('/v1/documents/seal').set('x-api-key', f.org.api_key).set('Content-Type', 'multipart/form-data; boundary=broken').send('--broken\r\ninvalid').expect(400);
+    await request(f.app).get('/health').expect(200);
+  });
+  it('recognizes supported file signatures', () => {
+    expect(resolveMimeType(Buffer.from('%PDF-1.7'), 'image/png')).toBe('application/pdf');
+    expect(resolveMimeType(Buffer.from([0xff, 0xd8, 0xff]))).toBe('image/jpeg');
+    expect(resolveMimeType(Buffer.from('text'), undefined, 'file.txt')).toBe('text/plain');
+  });
+});
+
+describe('Persistent adapters', () => {
+  it('recovers a concurrent registration winner without overwriting its state', async () => {
+    const winner = { id: 'existing', status: 'REVOKED' };
+    const findUnique = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(winner);
+    const prisma = { device: { findUnique, create: vi.fn().mockRejectedValue({ code: 'P2002' }) } };
+    const repo = new PrismaRepository(prisma as any);
+    const result = await repo.registerDevice({ orgId: 'org', hardwareHash: 'hash', publicKey: keys.publicKey, publicKeyFingerprint: 'fingerprint', keyAlgorithm: 'RSA-OAEP-256' });
+    expect(result).toEqual({ device: winner, created: false });
+  });
+  it('writes, reads and deletes S3 ciphertext without exposing plaintext or cross-bucket paths', async () => {
+    const send = vi.fn().mockResolvedValueOnce({}).mockResolvedValueOnce({ Body: { transformToByteArray: async () => Buffer.from('ciphertext') } }).mockResolvedValueOnce({});
+    const storage = new S3EncryptedStorage({ send } as any, 'vault');
+    const url = await storage.putEncryptedBlob('doc', 'org', Buffer.from('ciphertext'));
+    expect(send.mock.calls[0][0].input).toMatchObject({ Bucket: 'vault', Key: 'org/doc.enc', Body: Buffer.from('ciphertext') });
+    expect((await storage.getEncryptedBlob(url)).toString()).toBe('ciphertext');
+    await storage.deleteEncryptedBlob(url);
+    await expect(storage.getEncryptedBlob('s3://foreign/org/doc.enc')).rejects.toThrow();
+  });
+  it('fails closed when production persistence/signing configuration is absent', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    try { expect(() => createApp()).toThrow(/Production requires/); } finally { vi.unstubAllEnvs(); }
   });
 });

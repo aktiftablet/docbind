@@ -8,6 +8,7 @@ export interface ReactNativeScreenGuardNativeModule {
 }
 
 export interface ReactNativeKeystoreNativeModule {
+  keyAlgorithm?: 'RSA-OAEP-256' | 'RSA-OAEP-256-MGF1-SHA1';
   hasKeyPair: (alias: string) => Promise<boolean>;
   generateRsaKeyPair: (alias: string) => Promise<{ publicKeyPem: string } | string>;
   getPublicKeyPem: (alias: string) => Promise<string>;
@@ -18,11 +19,12 @@ export interface ReactNativeKeystoreNativeModule {
  * React Native NativeModule adapter for Android `WindowManager.LayoutParams.FLAG_SECURE`
  * and iOS `UIScreen.capturedDidChangeNotification`.
  *
- * Automatically connects to `NativeModules.DocBindScreenGuard` or custom native module
- * when running inside a React Native runtime.
+ * Pass `NativeModules.DocBindScreenGuard` explicitly. On iOS, also pass a
+ * `NativeEventEmitter` instance to subscribe to capture events.
  */
 export function createReactNativeScreenGuard(
-  nativeModuleOverride?: ReactNativeScreenGuardNativeModule
+  nativeModuleOverride?: ReactNativeScreenGuardNativeModule,
+  eventEmitter?: { addListener: (name: string, listener: (captured: boolean) => void) => { remove: () => void } }
 ): NativeScreenGuardLike {
   return {
     async enableSecureFlag() {
@@ -37,13 +39,17 @@ export function createReactNativeScreenGuard(
     },
     async isScreenCaptured() {
       if (nativeModuleOverride?.isScreenCaptured) {
-        return await nativeModuleOverride.isScreenCaptured();
+        return (await nativeModuleOverride.isScreenCaptured()) === true;
       }
       return false;
     },
     addCaptureChangeListener(listener: (isCaptured: boolean) => void) {
       if (nativeModuleOverride?.addCaptureListener) {
         const sub = nativeModuleOverride.addCaptureListener(listener);
+        return () => sub.remove();
+      }
+      if (eventEmitter) {
+        const sub = eventEmitter.addListener('DocBindCaptureChanged', listener);
         return () => sub.remove();
       }
       return () => {};
@@ -54,12 +60,13 @@ export function createReactNativeScreenGuard(
 /**
  * React Native NativeModule adapter for hardware-backed asymmetric key storage:
  * - Android Keystore (`KeyProperties.KEY_ALGORITHM_RSA`, `RSA/ECB/OAEPWithSHA-256AndMGF1Padding`)
- * - iOS Keychain / Secure Enclave (`kSecKeyAlgorithmRSAEncryptionOAEPSHA256`)
+ * - iOS Keychain (`kSecKeyAlgorithmRSAEncryptionOAEPSHA256`)
  */
 export function createReactNativeKeystore(
   nativeModule: ReactNativeKeystoreNativeModule
 ): NativeHardwareKeystoreLike {
   return {
+    keyAlgorithm: nativeModule.keyAlgorithm ?? 'RSA-OAEP-256',
     async hasKeyPair(alias: string): Promise<boolean> {
       return nativeModule.hasKeyPair(alias);
     },

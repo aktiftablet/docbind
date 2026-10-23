@@ -12,8 +12,12 @@ export interface WatermarkConfig {
 export interface DocumentSealerConfig {
   /** Base URL of the DocBind Backend API (e.g. "http://localhost:4000") */
   apiUrl?: string;
-  /** Organization API Key for authenticating device registration & payload requests */
-  apiKey?: string;
+  /** Short-lived, public-key-bound enrollment token supplied by your trusted application server. */
+  enrollmentToken?: string;
+  /** Device-scoped access token, returned by registration. Never use an organization API key here. */
+  deviceToken?: string;
+  /** Native wrapping variant; Android uses RSA-OAEP-256-MGF1-SHA1. */
+  keyAlgorithm?: 'RSA-OAEP-256' | 'RSA-OAEP-256-MGF1-SHA1';
   /** Optional custom fetch implementation */
   customFetch?: typeof fetch;
   /**
@@ -39,9 +43,13 @@ export interface DeviceTokenResult {
   publicKeyPem: string;
   /** Encoded token string combining deviceId and hardwareHash for SDK transport */
   token: string;
+  /** Device-scoped bearer credential; keep in platform protected storage if persisted. */
+  deviceToken?: string;
 }
 
 export interface EncryptedDocumentPayload {
+  aad_version?: 'v1' | 'v2';
+  key_algorithm?: 'RSA-OAEP-256' | 'RSA-OAEP-256-MGF1-SHA1';
   document_id: string;
   target_device_id: string;
   mime_type?: string;
@@ -63,7 +71,7 @@ export interface DecryptedDocumentInMemory {
   targetDeviceId: string;
   mimeType: string;
   originalName?: string | null;
-  /** In-memory decrypted file byte array (any MIME type). NEVER written to disk. */
+  /** Decrypted file byte array; the SDK does not explicitly persist plaintext. */
   bytes: Uint8Array;
   /** Wipes the decrypted bytes from RAM when the viewer unmounts */
   dispose: () => void;
@@ -76,8 +84,8 @@ export interface SecureViewerProps {
   preventScreenshot?: boolean;
   /** Dynamic watermark overlay configuration */
   watermark?: WatermarkConfig;
-  /** Optional API key override for fetching payloadUrl */
-  apiKey?: string;
+  /** Device-scoped credential override for fetching payloadUrl */
+  deviceToken?: string;
   /** Optional callback fired when document is decrypted in memory */
   onDocumentLoaded?: (meta: { documentId: string; byteLength: number }) => void;
   /** Optional callback fired on decryption or network error */
@@ -110,6 +118,7 @@ export interface ReactNativeDeviceInfoLike {
 }
 
 export interface NativeHardwareKeystoreLike {
+  keyAlgorithm?: 'RSA-OAEP-256' | 'RSA-OAEP-256-MGF1-SHA1';
   hasKeyPair: (alias: string) => Promise<boolean>;
   generateRsaKeyPair: (alias: string) => Promise<{ publicKeyPem: string }>;
   getPublicKeyPem: (alias: string) => Promise<string>;

@@ -13,9 +13,9 @@ export interface StoredKeyPairRecord {
 }
 
 /**
- * Manages hardware-bound RSA-OAEP 2048 key pairs and performs zero-knowledge
+ * Manages platform-protected RSA-OAEP 2048 key pairs and performs
  * in-memory envelope decryption:
- * - On Mobile (React Native): Uses iOS Secure Enclave / Android Keystore via NativeHardwareKeystoreLike.
+ * - On Mobile (React Native): Uses iOS Keychain / Android Keystore via NativeHardwareKeystoreLike.
  * - On Web: Generates WebCrypto RSA-OAEP 2048 keys with `extractable: false` and persists the
  *   non-extractable CryptoKey handle in IndexedDB so raw private key bytes can never be exported.
  */
@@ -29,7 +29,7 @@ export class DeviceKeyStore {
 
   /**
    * Ensures an RSA-OAEP 2048-bit key pair exists for this device and returns its PEM SPKI Public Key.
-   * The private key is strictly non-extractable.
+   * Web private keys are non-extractable through WebCrypto; native protection depends on the platform.
    */
   public async getOrCreatePublicKeyPem(): Promise<string> {
     if (this.nativeKeystore) {
@@ -85,15 +85,27 @@ export class DeviceKeyStore {
     encryptedDekBase64: string;
     ivBase64: string;
     targetDeviceId: string;
+    documentId?: string;
+    mimeType?: string;
+    aadVersion?: 'v1' | 'v2';
+    keyAlgorithm?: 'RSA-OAEP-256' | 'RSA-OAEP-256-MGF1-SHA1';
   }): Promise<Uint8Array> {
     const subtle = this.getSubtleCrypto();
     const encryptedDocBytes = this.base64ToUint8Array(params.encryptedDocumentBase64);
     const encryptedDekBytes = this.base64ToUint8Array(params.encryptedDekBase64);
     const ivBytes = this.base64ToUint8Array(params.ivBase64);
-    const aadBytes = new TextEncoder().encode(params.targetDeviceId);
+    const version = params.aadVersion ?? 'v1';
+    if (version !== 'v1' && version !== 'v2') throw new Error('Unsupported AAD version');
+    if (version === 'v2' && (!params.documentId || !params.mimeType)) throw new Error('Missing authenticated document metadata');
+    const aadBytes = new TextEncoder().encode(version === 'v2'
+      ? `docbind:v2|${params.targetDeviceId}|${params.documentId}|${params.mimeType}` : params.targetDeviceId);
+    const keyAlgorithm = params.keyAlgorithm ?? 'RSA-OAEP-256';
+    if (keyAlgorithm !== (this.nativeKeystore?.keyAlgorithm ?? 'RSA-OAEP-256')) {
+      throw new Error('Envelope key algorithm does not match this keystore');
+    }
 
     if (this.nativeKeystore) {
-      // Mobile Native Keystore path: decrypt DEK in Secure Enclave / Android Keystore
+      // Mobile Native Keystore path: decrypt DEK in Keychain / Android Keystore
       const rawDekBytes = await this.nativeKeystore.rsaOaepDecrypt(
         this.keyAlias,
         params.encryptedDekBase64

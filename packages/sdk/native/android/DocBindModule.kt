@@ -3,6 +3,8 @@ package com.securedoc.docbind
 import android.app.Activity
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.security.keystore.KeyInfo
+import java.security.KeyFactory
 import android.util.Base64
 import android.view.WindowManager
 import com.facebook.react.bridge.Promise
@@ -24,6 +26,24 @@ import javax.crypto.spec.PSource
 class DocBindModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
     override fun getName(): String = "DocBindScreenGuard"
+    override fun getConstants(): MutableMap<String, Any> = mutableMapOf("keyAlgorithm" to "RSA-OAEP-256-MGF1-SHA1")
+
+    private fun requireHardwareKey(alias: String) {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val key = ks.getKey(alias, null)
+        val info = KeyFactory.getInstance("RSA", "AndroidKeyStore").getKeySpec(key, KeyInfo::class.java)
+        if (!info.isInsideSecureHardware) throw IllegalStateException("Hardware-backed RSA required on this device")
+    }
+
+    @ReactMethod
+    fun getPublicKeyPem(alias: String, promise: Promise) {
+        try {
+            requireHardwareKey(alias)
+            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val certificate = ks.getCertificate(alias) ?: throw IllegalStateException("Key not found")
+            promise.resolve(formatPem(Base64.encodeToString(certificate.publicKey.encoded, Base64.NO_WRAP)))
+        } catch (e: Exception) { promise.reject("KEYSTORE_ERROR", e.message, e) }
+    }
 
     @ReactMethod
     fun enableSecureFlag(promise: Promise) {
@@ -67,6 +87,11 @@ class DocBindModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     @ReactMethod
     fun generateRsaKeyPair(alias: String, promise: Promise) {
         try {
+            val existing = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            if (existing.containsAlias(alias)) {
+                getPublicKeyPem(alias, promise)
+                return
+            }
             val kpg = KeyPairGenerator.getInstance(
                 KeyProperties.KEY_ALGORITHM_RSA,
                 "AndroidKeyStore"
@@ -82,6 +107,7 @@ class DocBindModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
 
             kpg.initialize(spec)
             val keyPair = kpg.generateKeyPair()
+            requireHardwareKey(alias)
             val spkiBase64 = Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP)
             val pem = formatPem(spkiBase64)
             promise.resolve(pem)
@@ -94,12 +120,13 @@ class DocBindModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     fun rsaOaepDecrypt(alias: String, encryptedDekBase64: String, promise: Promise) {
         try {
             val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            requireHardwareKey(alias)
             val privateKey = ks.getKey(alias, null)
             val cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
             val oaepParams = OAEPParameterSpec(
                 "SHA-256",
                 "MGF1",
-                MGF1ParameterSpec.SHA256,
+                MGF1ParameterSpec.SHA1,
                 PSource.PSpecified.DEFAULT
             )
             cipher.init(Cipher.DECRYPT_MODE, privateKey, oaepParams)

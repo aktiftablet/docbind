@@ -57,14 +57,17 @@ export class DocumentSealer {
   public static Viewer: FC<SecureViewerProps>;
 
   /**
-   * Configures the SDK with backend API URL, organization API key, and optional React Native bridges.
+   * Configures the SDK with backend API URL, scoped device credentials, and optional React Native bridges.
    */
   public static configure(config: DocumentSealerConfig): void {
     this.config = {
       ...this.config,
       ...config,
     };
-    this.keyStore = new DeviceKeyStore(config.nativeModules?.secureKeystore);
+    // Credential refresh must not discard a native adapter or an in-memory key.
+    if ('nativeModules' in config) {
+      this.keyStore = new DeviceKeyStore(config.nativeModules?.secureKeystore);
+    }
     this.cachedDeviceToken = null;
   }
 
@@ -88,7 +91,7 @@ export class DocumentSealer {
   }
 
   /**
-   * 1. Generates or retrieves the non-extractable RSA-OAEP 2048 key pair in Secure Enclave / Keystore / IndexedDB.
+   * 1. Generates or retrieves the non-extractable RSA-OAEP 2048 key pair in Keychain / Keystore / IndexedDB.
    * 2. Computes the deterministic SHA-256 hardware fingerprint hash.
    * 3. Registers the device with `POST /v1/devices/register` if `apiUrl` is reachable,
    *    returning the registered `deviceId`, `hardwareHash`, `publicKeyPem`, and composite `token`.
@@ -114,18 +117,20 @@ export class DocumentSealer {
         const headers: Record<string, string> = {
           'Content-Type': 'application/json',
         };
-        if (this.config.apiKey) {
-          headers['x-api-key'] = this.config.apiKey;
-        }
+        const credential = this.config.enrollmentToken ?? this.config.deviceToken;
+        if (!credential) throw new Error('Enrollment token or device token required. Obtain enrollment approval from your application server.');
+        headers.Authorization = `Bearer ${credential}`;
 
         const registerUrl = `${this.config.apiUrl.replace(/\/$/, '')}/v1/devices/register`;
         const response = await fetchFn(registerUrl, {
           method: 'POST',
+          redirect: 'error',
           headers,
           body: JSON.stringify({
             device_id: hardwareHash,
             hardware_hash: hardwareHash,
             public_key: publicKeyPem,
+            key_algorithm: this.config.keyAlgorithm ?? this.config.nativeModules?.secureKeystore?.keyAlgorithm ?? 'RSA-OAEP-256',
             metadata,
           }),
         });
@@ -140,8 +145,11 @@ export class DocumentSealer {
         const data = (await response.json()) as {
           success: boolean;
           registered_device_id: string;
+          device_token: string;
         };
         registeredDeviceId = data.registered_device_id;
+        this.config.deviceToken = data.device_token;
+        this.config.enrollmentToken = undefined;
       }
     }
 
@@ -157,6 +165,7 @@ export class DocumentSealer {
       deviceId: registeredDeviceId,
       hardwareHash,
       publicKeyPem,
+      deviceToken: this.config.deviceToken,
       token: encodedToken,
     };
 
@@ -169,33 +178,24 @@ export class DocumentSealer {
    */
   public static async fetchAndDecryptInMemory(
     payloadUrl: string,
-    apiKeyOverride?: string
+    deviceTokenOverride?: string
   ): Promise<DecryptedDocumentInMemory> {
     const fetchFn = this.config.customFetch ?? globalThis.fetch;
     if (typeof fetchFn !== 'function') {
       throw new Error('Global fetch is not available. Provide customFetch in DocumentSealer.configure().');
     }
 
-    const deviceInfo =
-      this.cachedDeviceToken ??
-      (await this.getDeviceToken({ skipBackendRegistration: true }));
-
-    const headers: Record<string, string> = {
-      Accept: 'application/json',
-      'x-hardware-hash': deviceInfo.hardwareHash,
-    };
-
-    if (!deviceInfo.deviceId.startsWith('local_')) {
-      headers['x-device-id'] = deviceInfo.deviceId;
-    }
-
-    const effectiveApiKey = apiKeyOverride ?? this.config.apiKey;
-    if (effectiveApiKey) {
-      headers['x-api-key'] = effectiveApiKey;
+    const credential = deviceTokenOverride ?? this.config.deviceToken;
+    if (!credential) throw new Error('Device token required. Register the device first.');
+    const headers: Record<string, string> = { Accept: 'application/json', Authorization: `Bearer ${credential}` };
+    // Prevent sending a device credential to a foreign origin through a payload URL.
+    if (this.config.apiUrl && new URL(payloadUrl, this.config.apiUrl).origin !== new URL(this.config.apiUrl).origin) {
+      throw new Error('Payload URL must use the configured API origin');
     }
 
     const response = await fetchFn(payloadUrl, {
       method: 'GET',
+      redirect: 'error',
       headers,
     });
 
@@ -240,6 +240,10 @@ export class DocumentSealer {
       encryptedDekBase64: payload.encrypted_dek,
       ivBase64: payload.iv,
       targetDeviceId: payload.target_device_id,
+      documentId: payload.document_id,
+      mimeType: payload.mime_type,
+      aadVersion: payload.aad_version,
+      keyAlgorithm: payload.key_algorithm,
     });
 
     return {
@@ -249,7 +253,7 @@ export class DocumentSealer {
       originalName: payload.original_name ?? null,
       bytes: decryptedBytes,
       dispose: () => {
-        // Cryptographically zero out decrypted file bytes from RAM on unmount
+        // Clear this buffer; runtime/OS copies may still exist.
         decryptedBytes.fill(0);
       },
     };

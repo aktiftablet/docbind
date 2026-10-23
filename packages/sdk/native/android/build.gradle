@@ -1,0 +1,14 @@
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24' }
+}
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+android {
+    namespace 'com.securedoc.docbind'
+    compileSdkVersion rootProject.ext.has('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
+    defaultConfig { minSdkVersion 23 }
+    sourceSets.main { java.srcDirs = ['.']; manifest.srcFile 'AndroidManifest.xml' }
+}
+repositories { google(); mavenCentral() }
+dependencies { implementation 'com.facebook.react:react-android' }

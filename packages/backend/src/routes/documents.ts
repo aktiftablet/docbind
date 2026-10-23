@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { requireRole } from '../middleware/auth.js';
 import { Router, type Request, type Response } from 'express';
 import multer from 'multer';
 import type { DataRepository } from '../db/repository.js';
@@ -15,6 +16,7 @@ const upload = multer({
   limits: {
     // Transport cap = largest category limit; per-category limits are enforced after MIME resolution.
     fileSize: getHardUploadCapBytes(),
+    files: 1, fields: 4, parts: 5, fieldSize: 8192, fieldNameSize: 100,
   },
 });
 
@@ -23,7 +25,7 @@ function uploadSingle(field: string) {
   const handler = upload.single(field);
   return (req: Request, res: Response, next: (err?: unknown) => void): void => {
     handler(req, res, (err?: unknown) => {
-      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      if (err instanceof multer.MulterError) {
         res.status(413).json({
           success: false,
           error: 'File too large.',
@@ -31,7 +33,8 @@ function uploadSingle(field: string) {
         });
         return;
       }
-      next(err);
+      if (err) { res.status(400).json({ error: 'Malformed multipart upload' }); return; }
+      next();
     });
   };
 }
@@ -50,8 +53,11 @@ export function createDocumentRouter(
    */
   router.post(
     '/seal',
+    requireRole('admin'),
     uploadSingle('file'),
     async (req: Request, res: Response): Promise<void> => {
+      let fileBuffer: Buffer | undefined;
+      let uncommittedStorageUrl: string | undefined;
       try {
         const targetDeviceId = req.body?.target_device_id as string | undefined;
         if (!targetDeviceId || typeof targetDeviceId !== 'string') {
@@ -63,7 +69,7 @@ export function createDocumentRouter(
         }
 
         // Support multipart file upload or base64 buffer in JSON body
-        let fileBuffer: Buffer | undefined = req.file?.buffer;
+        fileBuffer = req.file?.buffer;
         let originalName: string | undefined = req.file?.originalname;
         let declaredMime: string | undefined = req.file?.mimetype;
 
@@ -120,7 +126,8 @@ export function createDocumentRouter(
         const sealed = EnvelopeCryptoService.sealDocument(
           fileBuffer,
           device.public_key,
-          device.id
+          { targetDeviceId: device.id, documentId, mimeType },
+          device.key_algorithm
         );
 
         // Zero out plaintext upload buffer immediately after encryption
@@ -132,6 +139,7 @@ export function createDocumentRouter(
           sealed.encryptedDocument
         );
 
+        uncommittedStorageUrl = storageUrl;
         const docRecord = await repo.createDocument({
           id: documentId,
           orgId: req.organization!.id,
@@ -142,13 +150,18 @@ export function createDocumentRouter(
           storageUrl,
           originalName,
           mimeType,
-          sizeBytes: sealed.encryptedDocument.length,
+          encryptedSizeBytes: sealed.encryptedDocument.length,
+          aadVersion: sealed.aadVersion,
+          keyAlgorithm: sealed.keyAlgorithm,
         });
 
+        uncommittedStorageUrl = undefined;
         res.status(201).json({
           success: true,
           document_id: docRecord.id,
           target_device_id: docRecord.target_device_id,
+          aad_version: docRecord.aad_version,
+          key_algorithm: docRecord.key_algorithm,
           encrypted_dek: docRecord.encrypted_dek,
           iv: docRecord.iv,
           auth_tag: docRecord.auth_tag,
@@ -157,10 +170,15 @@ export function createDocumentRouter(
           encrypted_document: sealed.encryptedDocument.toString('base64'),
         });
       } catch (err) {
+        if (uncommittedStorageUrl) await storage.deleteEncryptedBlob(uncommittedStorageUrl).catch(() => {});
         res.status(500).json({
           success: false,
-          error: err instanceof Error ? err.message : 'Failed to seal document',
+          error: 'Failed to seal document',
         });
+      } finally {
+        fileBuffer?.fill(0);
+        req.file?.buffer.fill(0);
+        if (req.body) delete req.body.file_base64;
       }
     }
   );
@@ -168,9 +186,9 @@ export function createDocumentRouter(
   /**
    * GET /v1/documents/:id/payload
    * Fetches the encrypted document payload and wrapped DEK for the target device SDK.
-   * Optionally verifies `x-device-hardware-hash` header if provided by the client SDK.
+   * Requires an active, device-scoped bearer token matching the target device.
    */
-  router.get('/:id/payload', async (req: Request, res: Response): Promise<void> => {
+  router.get('/:id/payload', requireRole('device'), async (req: Request, res: Response): Promise<void> => {
     try {
       const document = await repo.findDocumentById(req.params.id);
       if (!document || document.org_id !== req.organization!.id) {
@@ -190,29 +208,13 @@ export function createDocumentRouter(
         return;
       }
 
-      // If client SDK sends its hardware fingerprint hash or device ID header, enforce match
-      const requestingDeviceId = req.headers['x-device-id'] as string | undefined;
-      if (requestingDeviceId && requestingDeviceId !== device.id) {
-        res.status(403).json({
-          success: false,
-          error: 'Device ID mismatch: document is bound to a different hardware device.',
-        });
+      if (req.principal!.subject !== document.target_device_id) {
+        res.status(403).json({ error: 'Document belongs to a different device' });
         return;
       }
-
-      const requestingHardwareHash = req.headers['x-hardware-hash'] as string | undefined;
-      if (requestingHardwareHash) {
-        const normalizedReqHash = /^[a-f0-9]{64}$/i.test(requestingHardwareHash)
-          ? requestingHardwareHash.toLowerCase()
-          : EnvelopeCryptoService.hashHardwareFingerprint(requestingHardwareHash);
-
-        if (normalizedReqHash !== device.hardware_hash) {
-          res.status(403).json({
-            success: false,
-            error: 'Hardware fingerprint mismatch: unauthorized device.',
-          });
-          return;
-        }
+      if (document.expires_at && document.expires_at <= new Date()) {
+        res.status(410).json({ error: 'Document expired' });
+        return;
       }
 
       const encryptedBlob = await storage.getEncryptedBlob(document.storage_url);
@@ -232,20 +234,22 @@ export function createDocumentRouter(
         mime_type: document.mime_type,
         original_name: document.original_name,
         size_bytes: encryptedBlob.length,
+        aad_version: document.aad_version,
+        key_algorithm: document.key_algorithm,
         encrypted_dek: document.encrypted_dek,
         iv: document.iv,
         auth_tag: document.auth_tag,
         encrypted_document: encryptedBlob.toString('base64'),
         algorithm: {
           document_cipher: 'AES-256-GCM',
-          key_encryption: 'RSA-OAEP-256',
-          aad_binding: 'target_device_id',
+          key_encryption: document.key_algorithm,
+          aad_binding: document.aad_version,
         },
       });
     } catch (err) {
       res.status(500).json({
         success: false,
-        error: err instanceof Error ? err.message : 'Failed to fetch document payload',
+        error: 'Failed to fetch document payload',
       });
     }
   });
